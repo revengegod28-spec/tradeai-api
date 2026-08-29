@@ -53,6 +53,90 @@ def is_price_sane(symbol: str, price: float) -> bool:
         return price > 0
     return bounds[0] <= price <= bounds[1]
 
+# === v4.5.3: technical indicators (RSI / MACD / MA) ===
+
+def _ema(values, period):
+    """Exponential moving average."""
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+def _sma(values, period):
+    """Simple moving average."""
+    if len(values) < period:
+        return None
+    return round(sum(values[-period:]) / period, 2)
+
+
+def _rsi(closes, period=14):
+    """RSI using Wilder's smoothing."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(0, diff))
+        losses.append(max(0, -diff))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def _macd_signal(closes):
+    """Returns 'bullish' / 'bearish' / None based on MACD vs signal line."""
+    if len(closes) < 35:
+        return None
+    macd_series = []
+    for i in range(26, len(closes) + 1):
+        e12 = _ema(closes[:i], 12)
+        e26 = _ema(closes[:i], 26)
+        if e12 is not None and e26 is not None:
+            macd_series.append(e12 - e26)
+    if len(macd_series) < 9:
+        return None
+    signal = _ema(macd_series, 9)
+    macd_now = macd_series[-1]
+    return "bullish" if macd_now > signal else "bearish"
+
+async def fetch_indicators(session, yahoo_symbol, internal_key):
+    """Fetch 6mo of daily candles and compute indicators."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+        async with session.get(
+            url,
+            params={"interval": "1d", "range": "6mo"},
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(f"[{internal_key}] indicators HTTP {resp.status}")
+                return None
+            data = await resp.json()
+        result = data["chart"]["result"][0]
+        quotes = result["indicators"]["quote"][0]
+        closes = [q["close"] for q in quotes if q.get("close") is not None]
+        if len(closes) < 30:
+            return None
+        return {
+            "rsi":        _rsi(closes),
+            "macd_signal": _macd_signal(closes),
+            "ma_50":      _sma(closes, 50),
+            "ma_200":     _sma(closes, 200) if len(closes) >= 200 else None,
+        }
+    except Exception as e:
+        logger.warning(f"[{internal_key}] indicator fetch failed: {e}")
+        return None
 
 def parse_yahoo_response(symbol: str, data: dict):
     try:
