@@ -28,13 +28,15 @@ SYMBOLS = {
     "SP500": "^GSPC", "NASDAQ": "^IXIC",
 }
 
+# v4.5.2: SP500 and NASDAQ now receive ETF prices (SPY/QQQ) instead of
+# index values, so bounds match the typical ETF range.
 PRICE_BOUNDS = {
     "NFLX": (300, 2000), "BTC": (1000, 1_000_000), "ETH": (50, 50_000),
     "AAPL": (50, 1000), "TSLA": (20, 2000), "NVDA": (10, 5000),
     "MSFT": (50, 2000), "GOOGL": (50, 2000), "AMZN": (20, 5000),
     "META": (50, 2000), "XAUUSD": (500, 20000),
     "WTI": (10, 500), "BRENT": (10, 500),
-    "SP500": (500, 20000), "NASDAQ": (3000, 50000),
+    "SP500": (300, 2000), "NASDAQ": (300, 2000),
 }
 
 HEADERS = {
@@ -92,6 +94,28 @@ async def fetch_one(session: aiohttp.ClientSession, key: str):
         return key, None
 
 
+# === v4.5.2: override S&P 500 and NASDAQ with ETF prices (SPY / QQQ) ===
+# The frontend shows AMEX:SPY and NASDAQ:QQQ charts. Returning index values
+# (~7,700 / ~26,400) caused a 10x visual mismatch with the chart. ETF prices
+# (~770 / ~600) match what the user sees in the chart.
+async def fetch_spy_qqq_overrides(session: aiohttp.ClientSession):
+    overrides = {}
+    for tv_symbol, internal_key in [("SPY", "SP500"), ("QQQ", "NASDAQ")]:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{tv_symbol}"
+            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[{tv_symbol}] HTTP {resp.status}")
+                    continue
+                data = await resp.json()
+                parsed = parse_yahoo_response(internal_key, data)
+                if parsed:
+                    overrides[internal_key] = parsed
+        except Exception as e:
+            logger.warning(f"[{tv_symbol}] fetch error: {e}")
+    return overrides
+
+
 @app.get("/")
 def root():
     return {
@@ -103,13 +127,6 @@ def root():
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    key = symbol.upper()
-    if key not in SYMBOLS:
-        raise HTTPException(404, f"Unknown symbol: {symbol}")
-    async with aiohttp.ClientSession() as session:
-        _, data = await fetch_one(session, key)
-    if not data:
-        raise HTTPException(503, f"Failed to fetch {symbol}")
     return data
 
 
@@ -124,6 +141,12 @@ async def get_all_prices():
         for key, data in await asyncio.gather(*tasks):
             if data:
                 results[key] = data
+
+        # v4.5.2: override S&P 500 and NASDAQ with ETF prices
+        etf_overrides = await fetch_spy_qqq_overrides(session)
+        for symbol, data in etf_overrides.items():
+            if data and "price" in data:
+                results[symbol] = data
 
     if not results:
         raise HTTPException(503, "No data fetched from upstream")
