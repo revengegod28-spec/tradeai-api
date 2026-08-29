@@ -231,6 +231,14 @@ async def get_all_prices():
         for symbol, data in etf_overrides.items():
             if data and "price" in data:
                 results[symbol] = data
+                        # v4.5.3: compute technical indicators
+        indicator_tasks = [
+            fetch_indicators(session, SYMBOLS.get(k, k), k)
+            for k in results.keys()
+        ]
+        for k, ind in zip(results.keys(), await asyncio.gather(*indicator_tasks)):
+            if ind:
+                results[k].update(ind)
 
     if not results:
         raise HTTPException(503, "No data fetched from upstream")
