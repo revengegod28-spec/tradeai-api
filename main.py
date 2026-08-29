@@ -115,7 +115,7 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
         async with session.get(
             url,
-            params={"interval": "1d", "range": "6mo"},
+            params={"interval": "1d", "range": "1y"},
             headers=HEADERS,
             timeout=aiohttp.ClientTimeout(total=10)
         ) as resp:
