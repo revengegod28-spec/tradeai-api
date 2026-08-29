@@ -125,7 +125,7 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
             data = await resp.json()
         result = data["chart"]["result"][0]
         quotes = result["indicators"]["quote"][0]
-        closes = [q["close"] for q in quotes if q.get("close") is not None]
+        closes = closes = [c for c in quotes["close"] if c is not None]
         if len(closes) < 30:
             return None
         return {
