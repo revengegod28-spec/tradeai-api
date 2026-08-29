@@ -31,7 +31,7 @@ SYMBOLS = {
 # v4.5.2: SP500 and NASDAQ now receive ETF prices (SPY/QQQ) instead of
 # index values, so bounds match the typical ETF range.
 PRICE_BOUNDS = {
-    "NFLX": (300, 2000), "BTC": (1000, 1_000_000), "ETH": (50, 50_000),
+    "NFLX": (50, 2000), "BTC": (1000, 1_000_000), "ETH": (50, 50_000),
     "AAPL": (50, 1000), "TSLA": (20, 2000), "NVDA": (10, 5000),
     "MSFT": (50, 2000), "GOOGL": (50, 2000), "AMZN": (20, 5000),
     "META": (50, 2000), "XAUUSD": (500, 20000),
