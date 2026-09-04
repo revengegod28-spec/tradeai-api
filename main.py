@@ -267,22 +267,24 @@ def _score_v5(closes, highs, lows, vols, i):
     else:
         action = 'wait'
 
-    # === LEVELS (wider stops, 1:2 RR) ===
+    # === LEVELS (v5.1: wider stops + 1:1.5 RR, more forgiving) ===
     stop = None
     target = None
     if action == 'buy':
-        # Stop: 2×ATR below price OR 2% below MA50 (whichever is closer)
-        atr_stop  = price - 2 * atr_v
-        ma50_stop = ma50 * 0.98
-        stop = min(atr_stop, ma50_stop)
-        risk = price - stop
-        target = price + 2 * risk  # RR 1:2
-    elif action == 'sell':
-        atr_stop  = price + 2 * atr_v
-        ma50_stop = ma50 * 1.02
+        # Stop: 1.5×ATR below price OR 2.5% below MA50 (whichever is FURTHER).
+        # v5.0 used min() which picked the tighter stop and got stopped out
+        # constantly. v5.1 uses max() to give the trade room to breathe.
+        atr_stop  = price - 1.5 * atr_v
+        ma50_stop = ma50 * 0.975
         stop = max(atr_stop, ma50_stop)
+        risk = price - stop
+        target = price + 1.5 * risk  # RR 1:1.5 (achievable within hold window)
+    elif action == 'sell':
+        atr_stop  = price + 1.5 * atr_v
+        ma50_stop = ma50 * 1.025
+        stop = min(atr_stop, ma50_stop)
         risk = stop - price
-        target = price - 2 * risk
+        target = price - 1.5 * risk
 
     return {
         'action': action, 'score': score, 'reasons': reasons,
@@ -305,7 +307,7 @@ def _simulate_v5(closes, highs, lows, vols, symbol):
         target = sig['target']
         # Look up to 7 days for stop/target hit
         exit_idx, exit_price, outcome = None, None, None
-        for j in range(i + 1, min(i + 8, len(closes))):
+        for j in range(i + 1, min(i + 11, len(closes))):
             if j < len(highs) and highs[j] >= target:
                 exit_idx, exit_price, outcome = j, target, 'win'
                 break
