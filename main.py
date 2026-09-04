@@ -308,7 +308,18 @@ def _score_v5(closes, highs, lows, vols, i):
 
 
 def _simulate_v5(closes, highs, lows, vols, symbol):
-    """Walk through 1y of data applying v5 rules, simulate entries/exits."""
+    """Walk through 1y of data applying v5 rules, simulate entries/exits.
+    v5.3 adds:
+      1) Hard loss cap at 10% — prevents catastrophic single trades that
+         destroyed v5.2's track record (max DD was 100%).
+      2) Trailing stop — once price moves +1% in our favor, move stop to
+         breakeven; once +2%, lock in +1%. Protects gains.
+    """
+    HARD_CAP_PCT = 0.10   # max single-trade loss
+    TRAIL_ARM_1  = 0.01   # +1% → stop to breakeven
+    TRAIL_ARM_2  = 0.02   # +2% → stop to +1%
+    MAX_HOLD     = 10
+
     trades = []
     i = 60
     while i < len(closes) - 3:
@@ -316,20 +327,35 @@ def _simulate_v5(closes, highs, lows, vols, symbol):
         if sig is None or sig['action'] != 'buy' or sig['stop'] is None:
             i += 1
             continue
-        entry = closes[i]
-        stop  = sig['stop']
-        target = sig['target']
-        # Look up to 7 days for stop/target hit
+        entry   = closes[i]
+        stop    = sig['stop']
+        target  = sig['target']
+        # Hard cap: stop at 10% loss max (whichever is tighter)
+        hard_stop   = entry * (1 - HARD_CAP_PCT)
+        active_stop = max(stop, hard_stop)  # max() = closer to entry
+
+        highest = entry  # track running high for trailing logic
         exit_idx, exit_price, outcome = None, None, None
-        for j in range(i + 1, min(i + 11, len(closes))):
-            if j < len(highs) and highs[j] >= target:
+        for j in range(i + 1, min(i + MAX_HOLD + 1, len(closes))):
+            cur_high = highs[j] if j < len(highs) else closes[j]
+            cur_low  = lows[j]  if j < len(lows)  else closes[j]
+            if cur_high > highest:
+                highest = cur_high
+            # Trailing stop escalation
+            gain = (highest - entry) / entry
+            if gain >= TRAIL_ARM_2:
+                active_stop = max(active_stop, entry * 1.01)  # lock in +1%
+            elif gain >= TRAIL_ARM_1:
+                active_stop = max(active_stop, entry)         # breakeven
+            # Check exits
+            if cur_high >= target:
                 exit_idx, exit_price, outcome = j, target, 'win'
                 break
-            if j < len(lows) and lows[j] <= stop:
-                exit_idx, exit_price, outcome = j, stop, 'loss'
+            if cur_low <= active_stop:
+                exit_idx, exit_price, outcome = j, active_stop, 'loss'
                 break
         if exit_idx is None:
-            exit_idx = min(i + 7, len(closes) - 1)
+            exit_idx = min(i + MAX_HOLD, len(closes) - 1)
             exit_price = closes[exit_idx]
             outcome = 'timeout'
         pnl_pct = ((exit_price - entry) / entry) * 100
@@ -479,7 +505,7 @@ async def fetch_spy_qqq_overrides(session):
 @app.get("/")
 def root():
     return {
-        "message": "TradeAI API v5.2 (Ensemble)",
+        "message": "TradeAI API v5.3 (Ensemble + Trailing + Cap)",
         "status": "active",
         "cache_ttl_seconds": CACHE_TTL.total_seconds(),
         "indicator_cache_ttl_seconds": INDICATOR_CACHE_TTL.total_seconds(),
@@ -574,7 +600,7 @@ async def backtest():
         if dd > max_dd: max_dd = dd
 
     result_data = {
-        "engine": "v5.2",
+        "engine": "v5.3",
         "period": "1y",
         "assets_tested": len(SYMBOLS),
         "total_trades": total,
