@@ -54,6 +54,7 @@ def is_price_sane(symbol: str, price: float) -> bool:
     return bounds[0] <= price <= bounds[1]
 
 # === v4.5.3: technical indicators (RSI / MACD / MA) ===
+# === v4.11: added Bollinger / Stochastic / ATR / Pivot / S/R ===
 
 def _ema(values, period):
     """Exponential moving average."""
@@ -109,8 +110,71 @@ def _macd_signal(closes):
     macd_now = macd_series[-1]
     return "bullish" if macd_now > signal else "bearish"
 
+
+# === v4.11: NEW HELPERS (Bollinger, Stochastic, ATR, S/R) ===
+
+def _std(arr, period):
+    """Population standard deviation of the last `period` values."""
+    if len(arr) < period:
+        return None
+    s = arr[-period:]
+    mean = sum(s) / period
+    return (sum((x - mean) ** 2 for x in s) / period) ** 0.5
+
+
+def _stochastic(highs, lows, closes, k_period=14, k_smooth=3, d_period=3):
+    """Slow Stochastic Oscillator. Returns (K, D) in 0-100."""
+    n = k_period + k_smooth + d_period
+    if len(closes) < n:
+        return 50.0, 50.0
+    raw_k = []
+    for i in range(k_period, len(closes) + 1):
+        win_h = max(highs[i - k_period:i])
+        win_l = min(lows[i - k_period:i])
+        if win_h == win_l:
+            raw_k.append(50.0)
+        else:
+            raw_k.append(100.0 * (closes[i - 1] - win_l) / (win_h - win_l))
+    if len(raw_k) < k_smooth:
+        return raw_k[-1], 50.0
+    sm_k = []
+    for i in range(k_smooth, len(raw_k) + 1):
+        sm_k.append(sum(raw_k[i - k_smooth:i]) / k_smooth)
+    if len(sm_k) < d_period:
+        return sm_k[-1], 50.0
+    d_vals = []
+    for i in range(d_period, len(sm_k) + 1):
+        d_vals.append(sum(sm_k[i - d_period:i]) / d_period)
+    return sm_k[-1], d_vals[-1]
+
+
+def _atr(highs, lows, closes, period=14):
+    """Average True Range (Wilder's smoothing)."""
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        h = highs[i]  if i < len(highs)  else closes[i]
+        l = lows[i]   if i < len(lows)   else closes[i]
+        c = closes[i - 1]
+        trs.append(max(h - l, abs(h - c), abs(l - c)))
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def _sr_levels(highs, lows, lookback=20):
+    """Support = min of recent lows, Resistance = max of recent highs."""
+    if len(highs) < lookback:
+        return None, None
+    return min(lows[-lookback:]), max(highs[-lookback:])
+
+
 async def fetch_indicators(session, yahoo_symbol, internal_key):
-    """Fetch 6mo of daily candles and compute indicators."""
+    """Fetch 1y of daily candles and compute technical indicators (v4.11)."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
         async with session.get(
@@ -125,18 +189,66 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
             data = await resp.json()
         result = data["chart"]["result"][0]
         quotes = result["indicators"]["quote"][0]
-        closes = closes = [c for c in quotes["close"] if c is not None]
+        closes = [c for c in quotes["close"] if c is not None]
+        highs  = [h for h in quotes["high"]  if h is not None]
+        lows   = [l for l in quotes["low"]   if l is not None]
+        vols   = [v for v in quotes.get("volume", []) if v is not None]
         if len(closes) < 30:
             return None
+
+        last_close = closes[-1]
+        prev_close = closes[-2] if len(closes) >= 2 else last_close
+        prev_high  = highs[-2]  if len(highs)  >= 2 else (highs[-1]  if highs  else last_close)
+        prev_low   = lows[-2]   if len(lows)   >= 2 else (lows[-1]   if lows   else last_close)
+
+        # Bollinger Bands (20, 2σ)
+        sma20  = _sma(closes, 20)
+        std20  = _std(closes, 20)
+        bb_up  = sma20 + 2 * std20 if std20 is not None else None
+        bb_mid = sma20
+        bb_lo  = sma20 - 2 * std20 if std20 is not None else None
+
+        # Stochastic (14, 3, 3)
+        stoch_k, stoch_d = _stochastic(highs, lows, closes, 14, 3, 3)
+
+        # ATR (14)
+        atr_val = _atr(highs, lows, closes, 14)
+
+        # Pivot Points (Classic) on previous day
+        pivot    = (prev_high + prev_low + prev_close) / 3
+        pivot_r1 = 2 * pivot - prev_low
+        pivot_s1 = 2 * pivot - prev_high
+        pivot_r2 = pivot + (prev_high - prev_low)
+        pivot_s2 = pivot - (prev_high - prev_low)
+
+        # Support / Resistance from recent 20-day swings
+        support, resistance = _sr_levels(highs, lows, 20)
+
         return {
-            "rsi":        _rsi(closes),
+            "rsi":         _rsi(closes),
             "macd_signal": _macd_signal(closes),
-            "ma_50":      _sma(closes, 50),
-            "ma_200":     _sma(closes, 200) if len(closes) >= 200 else None,
+            "ma_50":       _sma(closes, 50),
+            "ma_200":      _sma(closes, 200) if len(closes) >= 200 else None,
+            "bb_upper":    round(bb_up,  4) if bb_up  is not None else None,
+            "bb_middle":   round(bb_mid, 4) if bb_mid is not None else None,
+            "bb_lower":    round(bb_lo,  4) if bb_lo  is not None else None,
+            "stoch_k":     round(stoch_k, 2),
+            "stoch_d":     round(stoch_d, 2),
+            "atr":         round(atr_val, 4) if atr_val is not None else None,
+            "pivot":       round(pivot, 4),
+            "pivot_r1":    round(pivot_r1, 4),
+            "pivot_s1":    round(pivot_s1, 4),
+            "pivot_r2":    round(pivot_r2, 4),
+            "pivot_s2":    round(pivot_s2, 4),
+            "support":     round(support,    4) if support    is not None else None,
+            "resistance":  round(resistance, 4) if resistance is not None else None,
+            "last_volume": vols[-1] if vols else None,
+            "avg_volume":  round(sum(vols[-20:]) / min(20, len(vols)), 0) if vols else None,
         }
     except Exception as e:
         logger.warning(f"[{internal_key}] indicator fetch failed: {e}")
         return None
+
 
 def parse_yahoo_response(symbol: str, data: dict):
     try:
