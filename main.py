@@ -150,23 +150,30 @@ def _sr_levels(highs, lows, lookback=20):
 
 
 # ============================================================
-# v5.0: REWRITTEN RECOMMENDATION ENGINE
+# v5.2: ENSEMBLE ENGINE (3 strategies, vote to enter)
 # ============================================================
-# Strategy: trend-following with pullback entries and confluence filter.
-# - Strict trend filter via MA200 (no trade in neutral zone)
-# - Pullback entry at MA20/MA50 (better risk/reward)
-# - Multi-factor confluence (3+ signals required)
-# - Volume confirmation
-# - Wider stops (2x ATR), 1:2 RR, max 7-day hold
+# Each strategy votes +2 / +1 / 0 / -1 / -2. Total vote must reach +3
+# (buy) or -3 (sell) to enter. Trades only happen when 2 of 3 strategies
+# agree — fewer entries, but much higher quality.
+#
+# Strategy 1 (Trend): MA200 trend filter + pullback entry + RSI/MACD
+# Strategy 2 (Mean Reversion): Bollinger lower/upper touch + RSI extreme
+# Strategy 3 (Breakout): 20d high/low breakout + volume confirmation
+# ============================================================
 # ============================================================
 
 def _score_v5(closes, highs, lows, vols, i):
     """
-    Compute the v5 recommendation at historical day i.
-    Returns: dict {action, score, reasons, atr, stop, target, trend, ma200}
-             or None if not enough data.
+    v5.2 ENSEMBLE: three independent strategies each cast a vote in
+    [-2, +2]. We only enter when the total vote reaches +3 (long) or -3
+    (short) — i.e. when at least 2 of 3 strategies broadly agree. This
+    filters out low-conviction signals and keeps only the high-quality ones.
+
+    Strategy 1 (Trend): MA200 trend filter + pullback to MA20/MA50
+    Strategy 2 (Mean Reversion): Bollinger band touch + RSI extreme
+    Strategy 3 (Breakout): 20d high/low breakout + volume confirmation
     """
-    if i < 60:  # need MA50 + buffer
+    if i < 60:
         return None
 
     window = closes[:i + 1]
@@ -181,104 +188,97 @@ def _score_v5(closes, highs, lows, vols, i):
     rsi    = _rsi(window)
     macd   = _macd_signal(window)
     atr_v  = _atr(win_h, win_l, window, 14) if i >= 14 else None
+    sma20  = _sma(window, 20)
+    std20  = _std(window, 20) if i >= 19 else None
 
     if rsi is None or ma50 is None or atr_v is None:
         return None
 
-    # === TREND DETECTION (strict) ===
+    # === STRATEGY 1: TREND FOLLOWING ===
+    trend_vote = 0
+    trend_reasons = []
     trend = 'neutral'
     if ma200:
-        if price > ma200 * 1.005:   # 0.5% above MA200 to avoid whipsaw
+        if price > ma200 * 1.005:
             trend = 'up'
         elif price < ma200 * 0.995:
             trend = 'down'
-    if trend == 'neutral':
-        return {
-            'action': 'wait', 'score': 0,
-            'reasons': ['No clear trend (price near MA200)'],
-            'atr': atr_v, 'stop': None, 'target': None,
-            'trend': 'neutral', 'ma200': ma200,
-        }
 
-    # === CONFLUENCE SCORING (need 3+ aligned signals) ===
-    score = 0
-    reasons = []
-
-    # 1) Pullback to MA20 (close support) — strongest entry in uptrend
-    if trend == 'up' and ma20:
-        if abs(price - ma20) / ma20 < 0.02:
-            score += 2
-            reasons.append('pullback to MA20 (2%)')
-        elif abs(price - ma50) / ma50 < 0.03:
-            score += 1
-            reasons.append('pullback to MA50 (3%)')
-    elif trend == 'down' and ma20:
-        if abs(price - ma20) / ma20 < 0.02:
-            score -= 2
-            reasons.append('rally to MA20 (short setup)')
-        elif abs(price - ma50) / ma50 < 0.03:
-            score -= 1
-            reasons.append('rally to MA50 (short setup)')
-
-    # 2) RSI in trend direction (extreme = opportunity)
     if trend == 'up':
+        if ma20 and abs(price - ma20) / ma20 < 0.02:
+            trend_vote += 2; trend_reasons.append('pullback MA20')
+        elif abs(price - ma50) / ma50 < 0.03:
+            trend_vote += 1; trend_reasons.append('pullback MA50')
         if rsi < 35:
-            score += 2
-            reasons.append('RSI oversold in uptrend')
-        elif rsi > 70:
-            score -= 1
-            reasons.append('RSI overbought — caution')
-    else:
+            trend_vote += 1; trend_reasons.append('RSI oversold')
+        if macd == 'bullish':
+            trend_vote += 1; trend_reasons.append('MACD up')
+    elif trend == 'down':
+        if ma20 and abs(price - ma20) / ma20 < 0.02:
+            trend_vote -= 2; trend_reasons.append('rally MA20')
+        elif abs(price - ma50) / ma50 < 0.03:
+            trend_vote -= 1; trend_reasons.append('rally MA50')
         if rsi > 65:
-            score -= 2
-            reasons.append('RSI overbought in downtrend')
-        elif rsi < 30:
-            score += 1
-            reasons.append('RSI oversold — caution')
+            trend_vote -= 1; trend_reasons.append('RSI overbought')
+        if macd == 'bearish':
+            trend_vote -= 1; trend_reasons.append('MACD down')
 
-    # 3) MACD direction
-    if (trend == 'up' and macd == 'bullish') or \
-       (trend == 'down' and macd == 'bearish'):
-        score += 1 if trend == 'up' else -1
-        reasons.append('MACD aligned with trend')
-    else:
-        score += -1 if trend == 'up' else 1
-        reasons.append('MACD against trend')
+    # === STRATEGY 2: MEAN REVERSION (Bollinger touch) ===
+    reversion_vote = 0
+    reversion_reasons = []
+    if sma20 is not None and std20 is not None and std20 > 0:
+        bb_lower = sma20 - 2 * std20
+        bb_upper = sma20 + 2 * std20
+        # Buy at lower band (price within 1% of bb_lower)
+        if price <= bb_lower * 1.01:
+            reversion_vote += 2; reversion_reasons.append('BB lower touch')
+            if rsi < 30:
+                reversion_vote += 1; reversion_reasons.append('RSI extreme')
+        # Sell at upper band
+        elif price >= bb_upper * 0.99:
+            reversion_vote -= 2; reversion_reasons.append('BB upper touch')
+            if rsi > 70:
+                reversion_vote -= 1; reversion_reasons.append('RSI extreme')
 
-    # 4) Volume confirmation (new in v5.0)
-    vol_ratio = 1.0
-    if win_v and len(win_v) >= 20:
-        recent_vol = win_v[-1]
-        avg_vol = sum(win_v[-20:]) / 20
-        if avg_vol > 0:
-            vol_ratio = recent_vol / avg_vol
-            if vol_ratio > 1.2:
-                score += 1 if trend == 'up' else -1
-                reasons.append(f'volume confirming ({vol_ratio:.1f}x)')
-            elif vol_ratio < 0.7:
-                score += -1 if trend == 'up' else 1
-                reasons.append(f'volume weak ({vol_ratio:.1f}x)')
+    # === STRATEGY 3: BREAKOUT (20d high/low + volume) ===
+    breakout_vote = 0
+    breakout_reasons = []
+    if len(win_h) >= 20 and len(win_l) >= 20:
+        recent_high = max(win_h[-20:])
+        recent_low  = min(win_l[-20:])
+        # Buy on 20d high breakout (price within 0.2% of recent_high)
+        if price >= recent_high * 0.998:
+            breakout_vote += 2; breakout_reasons.append('20d high test')
+            if win_v and len(win_v) >= 20:
+                avg_v = sum(win_v[-20:]) / 20
+                if avg_v > 0 and win_v[-1] / avg_v > 1.2:
+                    breakout_vote += 1; breakout_reasons.append('volume confirms')
+        # Sell on 20d low breakdown
+        elif price <= recent_low * 1.002:
+            breakout_vote -= 2; breakout_reasons.append('20d low test')
+            if win_v and len(win_v) >= 20:
+                avg_v = sum(win_v[-20:]) / 20
+                if avg_v > 0 and win_v[-1] / avg_v > 1.2:
+                    breakout_vote -= 1; breakout_reasons.append('volume confirms')
 
-    # === DECISION (need score ≥ 3) ===
-    if trend == 'up' and score >= 3:
+    # === VOTING: total vote must reach ±3 to enter ===
+    total_vote = trend_vote + reversion_vote + breakout_vote
+    if total_vote >= 3:
         action = 'buy'
-    elif trend == 'down' and score <= -3:
+    elif total_vote <= -3:
         action = 'sell'
     else:
         action = 'wait'
 
-    # === LEVELS (v5.1: wider stops + 1:1.5 RR, more forgiving) ===
+    # === LEVELS (v5.1 logic: wider stop, 1:1.5 RR) ===
     stop = None
     target = None
     if action == 'buy':
-        # Stop: 1.5×ATR below price OR 2.5% below MA50 (whichever is FURTHER).
-        # v5.0 used min() which picked the tighter stop and got stopped out
-        # constantly. v5.1 uses max() to give the trade room to breathe.
         atr_stop  = price - 1.5 * atr_v
         ma50_stop = ma50 * 0.975
         stop = max(atr_stop, ma50_stop)
         risk = price - stop
-        target = price + 1.5 * risk  # RR 1:1.5 (achievable within hold window)
+        target = price + 1.5 * risk
     elif action == 'sell':
         atr_stop  = price + 1.5 * atr_v
         ma50_stop = ma50 * 1.025
@@ -286,10 +286,24 @@ def _score_v5(closes, highs, lows, vols, i):
         risk = stop - price
         target = price - 1.5 * risk
 
+    # Compose reasons with per-strategy breakdown so the UI shows votes.
+    reasons = []
+    def sign(v):
+        return ('+' if v >= 0 else '') + str(v)
+    if trend_reasons:
+        reasons.append(f"Trend {sign(trend_vote)}: {','.join(trend_reasons)}")
+    if reversion_reasons:
+        reasons.append(f"Reversion {sign(reversion_vote)}: {','.join(reversion_reasons)}")
+    if breakout_reasons:
+        reasons.append(f"Breakout {sign(breakout_vote)}: {','.join(breakout_reasons)}")
+    if not reasons:
+        reasons = [f'Total vote {total_vote} (need ±3 to enter)']
+
     return {
-        'action': action, 'score': score, 'reasons': reasons,
+        'action': action, 'score': total_vote, 'reasons': reasons,
         'atr': atr_v, 'stop': stop, 'target': target,
-        'trend': trend, 'ma200': ma200, 'vol_ratio': vol_ratio,
+        'trend': trend, 'ma200': ma200,
+        'votes': {'trend': trend_vote, 'reversion': reversion_vote, 'breakout': breakout_vote},
     }
 
 
@@ -465,7 +479,7 @@ async def fetch_spy_qqq_overrides(session):
 @app.get("/")
 def root():
     return {
-        "message": "TradeAI API v5.0",
+        "message": "TradeAI API v5.2 (Ensemble)",
         "status": "active",
         "cache_ttl_seconds": CACHE_TTL.total_seconds(),
         "indicator_cache_ttl_seconds": INDICATOR_CACHE_TTL.total_seconds(),
@@ -560,7 +574,7 @@ async def backtest():
         if dd > max_dd: max_dd = dd
 
     result_data = {
-        "engine": "v5.0",
+        "engine": "v5.2",
         "period": "1y",
         "assets_tested": len(SYMBOLS),
         "total_trades": total,
