@@ -46,6 +46,12 @@ HEADERS = {
 _cache = {"data": None, "ts": None}
 CACHE_TTL = timedelta(minutes=2)
 
+# v4.11.2: separate cache for computed technical indicators. Daily candles
+# change slowly, so 15 minutes is plenty — turns a ~15s cold start into an
+# instant response on every subsequent call within the TTL window.
+_indicator_cache = {}  # {yahoo_symbol: (data, timestamp)}
+INDICATOR_CACHE_TTL = timedelta(minutes=15)
+
 
 def is_price_sane(symbol: str, price: float) -> bool:
     bounds = PRICE_BOUNDS.get(symbol)
@@ -174,7 +180,16 @@ def _sr_levels(highs, lows, lookback=20):
 
 
 async def fetch_indicators(session, yahoo_symbol, internal_key):
-    """Fetch 1y of daily candles and compute technical indicators (v4.11)."""
+    """Fetch 1y of daily candles and compute technical indicators (v4.11).
+    v4.11.2: caches results for 15 minutes per symbol so repeated calls
+    within the window return instantly without hitting Yahoo."""
+    # Cache hit?
+    now = datetime.now()
+    if yahoo_symbol in _indicator_cache:
+        cached_data, cached_ts = _indicator_cache[yahoo_symbol]
+        if now - cached_ts < INDICATOR_CACHE_TTL:
+            return cached_data
+
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
         async with session.get(
@@ -224,7 +239,7 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
         # Support / Resistance from recent 20-day swings
         support, resistance = _sr_levels(highs, lows, 20)
 
-        return {
+        result_data = {
             "rsi":         _rsi(closes),
             "macd_signal": _macd_signal(closes),
             "ma_50":       _sma(closes, 50),
@@ -245,6 +260,9 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
             "last_volume": vols[-1] if vols else None,
             "avg_volume":  round(sum(vols[-20:]) / min(20, len(vols)), 0) if vols else None,
         }
+        # v4.11.2: cache the computed indicators
+        _indicator_cache[yahoo_symbol] = (result_data, now)
+        return result_data
     except Exception as e:
         logger.warning(f"[{internal_key}] indicator fetch failed: {e}")
         return None
@@ -291,9 +309,6 @@ async def fetch_one(session: aiohttp.ClientSession, key: str):
 
 
 # === v4.5.2: override S&P 500 and NASDAQ with ETF prices (SPY / QQQ) ===
-# The frontend shows AMEX:SPY and NASDAQ:QQQ charts. Returning index values
-# (~7,700 / ~26,400) caused a 10x visual mismatch with the chart. ETF prices
-# (~770 / ~600) match what the user sees in the chart.
 async def fetch_spy_qqq_overrides(session: aiohttp.ClientSession):
     overrides = {}
     for tv_symbol, internal_key in [("SPY", "SP500"), ("QQQ", "NASDAQ")]:
@@ -317,7 +332,8 @@ def root():
     return {
         "message": "TradeAI API",
         "status": "active",
-        "cache_ttl_seconds": CACHE_TTL.total_seconds()
+        "cache_ttl_seconds": CACHE_TTL.total_seconds(),
+        "indicator_cache_ttl_seconds": INDICATOR_CACHE_TTL.total_seconds(),
     }
 
 
