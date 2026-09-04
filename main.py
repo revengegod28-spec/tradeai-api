@@ -46,7 +46,7 @@ CACHE_TTL = timedelta(minutes=2)
 _indicator_cache = {}
 INDICATOR_CACHE_TTL = timedelta(minutes=15)
 _backtest_cache = {"data": None, "ts": None}
-BACKTEST_CACHE_TTL = timedelta(hours=6)
+BACKTEST_CACHE_TTL = timedelta(seconds=1)  # v5.3.2: effectively no cache
 
 
 def is_price_sane(symbol: str, price: float) -> bool:
@@ -475,8 +475,8 @@ async def get_all_prices():
 
 @app.get("/backtest")
 async def backtest():
-    if _backtest_cache["ts"] and datetime.now() - _backtest_cache["ts"] < BACKTEST_CACHE_TTL and _backtest_cache["data"]:
-        return _backtest_cache["data"]
+    # v5.3.2: always recompute (no cache) so code changes take effect immediately
+    pass
     all_trades = []
     by_symbol = {}
     async with aiohttp.ClientSession() as session:
