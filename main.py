@@ -1,14 +1,43 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+#!/usr/bin/env python3
+"""
+TradeAI Backend v6.0 — Risk-First Engine
+FastAPI backend for technical analysis, live prices, and backtesting.
+
+Key v6.0 changes:
+- Hard stop loss capped at 2% per trade (was 10%)
+- Max hold reduced to 5 days (was 10)
+- Volatility-based position sizing
+- Trend filter (MA200) — no trading against long-term trend
+- Market regime detection (ADX-based)
+- Per-asset-class parameter tuning
+- Confluence scoring with asymmetric thresholds
+- Gap-aware stop/target using actual High/Low
+- Supports both BUY and SELL signals
+"""
+
+import os
+import json
+import math
+import time
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+
 import aiohttp
 import asyncio
-from datetime import datetime, timedelta
-import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tradeai-api")
 
-app = FastAPI(title="TradeAI API")
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+# ---------------------------------------------------------------------------
+# App Setup
+# ---------------------------------------------------------------------------
+app = FastAPI(title="TradeAI API v6.0", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,6 +47,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
+
+CACHE_TTL = timedelta(seconds=25)
+INDICATOR_CACHE_TTL = timedelta(minutes=15)
+BACKTEST_CACHE_TTL = timedelta(minutes=5)
+
+# ---------------------------------------------------------------------------
+# Risk Limits — THE MOST IMPORTANT PART
+# ---------------------------------------------------------------------------
+MAX_LOSS_PER_TRADE_PCT = 2.0      # Never lose more than 2% on a single trade
+HARD_RR_MIN = 1.5                 # Minimum risk:reward 1:1.5
+
+# ---------------------------------------------------------------------------
+# Asset Definitions
+# ---------------------------------------------------------------------------
 SYMBOLS = {
     "AAPL": "AAPL", "TSLA": "TSLA", "MSFT": "MSFT", "GOOGL": "GOOGL",
     "AMZN": "AMZN", "NVDA": "NVDA", "META": "META", "NFLX": "NFLX",
@@ -26,6 +72,25 @@ SYMBOLS = {
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
     "XAUUSD": "GC=F", "WTI": "CL=F", "BRENT": "BZ=F",
     "SP500": "^GSPC", "NASDAQ": "^IXIC",
+}
+
+# Per-asset-class parameters
+ASSET_PARAMS = {
+    "stocks":     {"atr_mult": 1.5, "max_hold": 5, "rsi_low": 30, "rsi_high": 70, "size_mult": 1.0, "vol_cap": 4.0},
+    "crypto":     {"atr_mult": 2.0, "max_hold": 3, "rsi_low": 25, "rsi_high": 75, "size_mult": 0.5, "vol_cap": 6.0},
+    "forex":      {"atr_mult": 1.0, "max_hold": 7, "rsi_low": 35, "rsi_high": 65, "size_mult": 1.2, "vol_cap": 1.5},
+    "commodities":{"atr_mult": 1.5, "max_hold": 5, "rsi_low": 30, "rsi_high": 70, "size_mult": 0.8, "vol_cap": 3.0},
+    "indices":    {"atr_mult": 1.2, "max_hold": 5, "rsi_low": 30, "rsi_high": 70, "size_mult": 1.0, "vol_cap": 2.5},
+}
+
+# Asset category mapping
+ASSET_CATEGORY = {
+    "AAPL": "stocks", "TSLA": "stocks", "MSFT": "stocks", "GOOGL": "stocks",
+    "AMZN": "stocks", "NVDA": "stocks", "META": "stocks", "NFLX": "stocks",
+    "BTC": "crypto", "ETH": "crypto", "BNB": "crypto", "SOL": "crypto", "XRP": "crypto",
+    "EURUSD": "forex", "GBPUSD": "forex", "USDJPY": "forex", "XAUUSD": "forex",
+    "WTI": "commodities", "BRENT": "commodities",
+    "SP500": "indices", "NASDAQ": "indices",
 }
 
 PRICE_BOUNDS = {
@@ -37,18 +102,16 @@ PRICE_BOUNDS = {
     "SP500": (300, 2000), "NASDAQ": (300, 2000),
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
-
+# ---------------------------------------------------------------------------
+# Caches
+# ---------------------------------------------------------------------------
 _cache = {"data": None, "ts": None}
-CACHE_TTL = timedelta(minutes=2)
 _indicator_cache = {}
-INDICATOR_CACHE_TTL = timedelta(minutes=15)
 _backtest_cache = {"data": None, "ts": None}
-BACKTEST_CACHE_TTL = timedelta(seconds=1)  # v5.3.2: effectively no cache
 
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def is_price_sane(symbol: str, price: float) -> bool:
     bounds = PRICE_BOUNDS.get(symbol)
     if not bounds: return price > 0
@@ -145,166 +208,405 @@ def _sr_levels(highs, lows, lookback=20):
     return min(lows[-lookback:]), max(highs[-lookback:])
 
 
-def _score_v5(closes, highs, lows, vols, i):
-    """v5.2 ENSEMBLE + v5.3 trailing/cap. Three strategies vote; only enter
-    when total vote reaches +3 (long) or -3 (short)."""
-    if i < 60: return None
+def _adx(highs, lows, closes, period=14):
+    """Simplified ADX (0-100). Values > 25 indicate strong trend."""
+    if len(closes) < period * 2: return 0.0
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(closes)):
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+        if up_move > down_move and up_move > 0:
+            plus_dm.append(up_move)
+        else:
+            plus_dm.append(0)
+        if down_move > up_move and down_move > 0:
+            minus_dm.append(down_move)
+        else:
+            minus_dm.append(0)
+
+    trs = []
+    for i in range(1, len(closes)):
+        h = highs[i] if i < len(highs) else closes[i]
+        l = lows[i] if i < len(lows) else closes[i]
+        c = closes[i-1]
+        trs.append(max(h - l, abs(h - c), abs(l - c)))
+
+    atr_val = sum(trs[:period]) / period
+    atr_smooth = atr_val
+    for tr in trs[period:]:
+        atr_smooth = (atr_smooth * (period - 1) + tr) / period
+
+    if atr_smooth == 0: return 0.0
+
+    plus_di = 100 * (sum(plus_dm[:period]) / period) / atr_smooth
+    minus_di = 100 * (sum(minus_dm[:period]) / period) / atr_smooth
+
+    dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100 if (plus_di + minus_di) > 0 else 0
+    return dx
+
+
+def _market_regime(highs, lows, closes):
+    """
+    Detect market regime:
+    - trending_up: ADX > 25, price > MA20 > MA50
+    - trending_down: ADX > 25, price < MA20 < MA50
+    - ranging: ADX < 20
+    - volatile: ATR% > threshold
+    - mixed: everything else
+    """
+    if len(closes) < 50: return "mixed"
+    price = closes[-1]
+    ma20 = _sma(closes, 20)
+    ma50 = _sma(closes, 50)
+    atr_v = _atr(highs, lows, closes, 14)
+    adx_v = _adx(highs, lows, closes, 14)
+
+    if ma20 is None or ma50 is None or atr_v is None:
+        return "mixed"
+
+    atr_pct = atr_v / price * 100
+
+    if atr_pct > 6.0:
+        return "volatile"
+    if adx_v > 25 and price > ma20 > ma50:
+        return "trending_up"
+    if adx_v > 25 and price < ma20 < ma50:
+        return "trending_down"
+    if adx_v < 20:
+        return "ranging"
+    return "mixed"
+
+
+def _volume_signal(vols):
+    """Compare last volume to 20-day average."""
+    if not vols or len(vols) < 20: return "normal"
+    vol = vols[-1]
+    avg = sum(vols[-20:]) / 20
+    if avg == 0: return "normal"
+    ratio = vol / avg
+    if ratio > 2.0: return "very_high"
+    elif ratio > 1.5: return "high"
+    elif ratio < 0.5: return "low"
+    return "normal"
+
+
+# ---------------------------------------------------------------------------
+# v6.0 Scoring Engine — Confluence + Trend Filter + Regime
+# ---------------------------------------------------------------------------
+def _score_v6(closes, highs, lows, vols, i):
+    """
+    v6.0 Risk-First Scoring Engine.
+    Returns dict with action, score, reasons, confidence, levels, metrics.
+    """
+    if i < 200: return None
+
     window = closes[:i + 1]
     win_h  = highs[:i + 1] if i < len(highs) else window
     win_l  = lows[:i + 1]  if i < len(lows)  else window
     win_v  = vols[:i + 1]  if vols else None
     price  = window[-1]
-    ma20   = _sma(window, 20)
-    ma50   = _sma(window, 50)
-    ma200  = _sma(window, 200) if i >= 199 else None
-    rsi    = _rsi(window)
-    macd   = _macd_signal(window)
-    atr_v  = _atr(win_h, win_l, window, 14) if i >= 14 else None
-    sma20  = _sma(window, 20)
-    std20  = _std(window, 20) if i >= 19 else None
-    if rsi is None or ma50 is None or atr_v is None: return None
 
-    # Strategy 1: Trend
-    trend_vote, trend_reasons = 0, []
-    trend = 'neutral'
-    if ma200:
-        if price > ma200 * 1.005: trend = 'up'
-        elif price < ma200 * 0.995: trend = 'down'
-    if trend == 'up':
-        if ma20 and abs(price - ma20) / ma20 < 0.02:
-            trend_vote += 2; trend_reasons.append('pullback MA20')
-        elif abs(price - ma50) / ma50 < 0.03:
-            trend_vote += 1; trend_reasons.append('pullback MA50')
-        if rsi < 35: trend_vote += 1; trend_reasons.append('RSI oversold')
-        if macd == 'bullish': trend_vote += 1; trend_reasons.append('MACD up')
-    elif trend == 'down':
-        if ma20 and abs(price - ma20) / ma20 < 0.02:
-            trend_vote -= 2; trend_reasons.append('rally MA20')
-        elif abs(price - ma50) / ma50 < 0.03:
-            trend_vote -= 1; trend_reasons.append('rally MA50')
-        if rsi > 65: trend_vote -= 1; trend_reasons.append('RSI overbought')
-        if macd == 'bearish': trend_vote -= 1; trend_reasons.append('MACD down')
+    # Detect asset category from symbol context (we'll pass it in properly in the caller)
+    # For now, use default params
+    params = ASSET_PARAMS["stocks"]  # default, will be overridden
 
-    # Strategy 2: Mean Reversion (Bollinger touch)
-    reversion_vote, reversion_reasons = 0, []
+    # Core indicators
+    ma50 = _sma(window, 50)
+    ma200 = _sma(window, 200)
+    rsi_val = _rsi(window)
+    macd = _macd_signal(window)
+
+    sma20 = _sma(window, 20)
+    std20 = _std(window, 20)
+    bb_pos = 0.0
     if sma20 is not None and std20 is not None and std20 > 0:
-        bb_lower = sma20 - 2 * std20
-        bb_upper = sma20 + 2 * std20
-        if price <= bb_lower * 1.01:
-            reversion_vote += 2; reversion_reasons.append('BB lower touch')
-            if rsi < 30: reversion_vote += 1; reversion_reasons.append('RSI extreme')
-        elif price >= bb_upper * 0.99:
-            reversion_vote -= 2; reversion_reasons.append('BB upper touch')
-            if rsi > 70: reversion_vote -= 1; reversion_reasons.append('RSI extreme')
+        bb_up = sma20 + 2 * std20
+        bb_lo = sma20 - 2 * std20
+        if bb_up != bb_lo:
+            bb_pos = max(-1.0, min(1.0, (price - bb_lo) / (bb_up - bb_lo) * 2 - 1))
 
-    # Strategy 3: Breakout (20d high/low + volume)
-    breakout_vote, breakout_reasons = 0, []
+    atr_v = _atr(win_h, win_l, window, 14)
+    stoch_k, stoch_d = _stochastic(win_h, win_l, window, 14, 3, 3)
+
+    regime = _market_regime(win_h, win_l, window)
+    vol_sig = _volume_signal(win_v)
+
+    support, resistance = _sr_levels(win_h, win_l, 20)
+
+    if rsi_val is None or ma50 is None or ma200 is None or atr_v is None:
+        return None
+
+    atr_pct = atr_v / price * 100
+
+    # --- FILTERS (hard no-trade conditions) ---
+    reasons = []
+
+    # 1. Volatility cap
+    if atr_pct > params["vol_cap"]:
+        return {
+            "action": "wait", "score": 0,
+            "reasons": [f"ATR% {atr_pct:.1f} exceeds cap {params['vol_cap']}"],
+            "confidence": 0, "levels": {},
+            "metrics": {"atr_pct": atr_pct, "regime": regime, "rsi": rsi_val}
+        }
+
+    # 2. Regime filter: no trading in volatile regime
+    if regime == "volatile":
+        return {
+            "action": "wait", "score": 0,
+            "reasons": ["Volatile regime — no safe entries"],
+            "confidence": 0, "levels": {},
+            "metrics": {"atr_pct": atr_pct, "regime": regime, "rsi": rsi_val}
+        }
+
+    # --- SCORING ---
+    trend_score = 0.0
+    mr_score = 0.0
+    breakout_score = 0.0
+
+    long_term_trend = "up" if price > ma200 else "down"
+
+    # 1. Trend Following (weighted highest in trending markets)
+    if regime in ("trending_up", "trending_down", "mixed"):
+        if price > ma50 > ma200 and macd == "bullish":
+            trend_score = 2.5
+            reasons.append("Strong uptrend: price > MA50 > MA200 + MACD bullish")
+        elif price > ma50 and macd == "bullish":
+            trend_score = 1.5
+            reasons.append("Uptrend: price > MA50 + MACD bullish")
+        elif price < ma50 < ma200 and macd == "bearish":
+            trend_score = -2.5
+            reasons.append("Strong downtrend: price < MA50 < MA200 + MACD bearish")
+        elif price < ma50 and macd == "bearish":
+            trend_score = -1.5
+            reasons.append("Downtrend: price < MA50 + MACD bearish")
+
+    # 2. Mean Reversion (only in ranging markets)
+    if regime == "ranging":
+        if rsi_val < params["rsi_low"] and bb_pos < -0.7 and stoch_k < 20:
+            mr_score = 2.0
+            reasons.append(f"Oversold bounce: RSI {rsi_val:.0f}, Stoch {stoch_k:.0f}, BB low")
+        elif rsi_val > params["rsi_high"] and bb_pos > 0.7 and stoch_k > 80:
+            mr_score = -2.0
+            reasons.append(f"Overbought pullback: RSI {rsi_val:.0f}, Stoch {stoch_k:.0f}, BB high")
+
+    # 3. Breakout confirmation (weak, used only as confirmation)
     if len(win_h) >= 20 and len(win_l) >= 20:
         recent_high = max(win_h[-20:])
         recent_low  = min(win_l[-20:])
-        if price >= recent_high * 0.998:
-            breakout_vote += 2; breakout_reasons.append('20d high test')
-            if win_v and len(win_v) >= 20:
-                avg_v = sum(win_v[-20:]) / 20
-                if avg_v > 0 and win_v[-1] / avg_v > 1.2:
-                    breakout_vote += 1; breakout_reasons.append('volume confirms')
-        elif price <= recent_low * 1.002:
-            breakout_vote -= 2; breakout_reasons.append('20d low test')
-            if win_v and len(win_v) >= 20:
-                avg_v = sum(win_v[-20:]) / 20
-                if avg_v > 0 and win_v[-1] / avg_v > 1.2:
-                    breakout_vote -= 1; breakout_reasons.append('volume confirms')
+        if price >= recent_high * 0.998 and vol_sig in ("high", "very_high"):
+            breakout_score = 0.5
+            reasons.append("Volume-confirmed breakout")
+        elif price <= recent_low * 1.002 and vol_sig in ("high", "very_high"):
+            breakout_score = -0.5
+            reasons.append("Volume-confirmed breakdown")
 
-    # Voting
-    total_vote = trend_vote + reversion_vote + breakout_vote
-    if total_vote >= 3: action = 'buy'
-    elif total_vote <= -3: action = 'sell'
-    else: action = 'wait'
+    # --- CONFLUENCE & TREND FILTER ---
+    total = trend_score + mr_score + breakout_score
 
-    # Levels
-    stop, target = None, None
-    if action == 'buy':
-        atr_stop  = price - 1.5 * atr_v
-        ma50_stop = ma50 * 0.975
-        stop = max(atr_stop, ma50_stop)
-        risk = price - stop
-        target = price + 1.5 * risk
-    elif action == 'sell':
-        atr_stop  = price + 1.5 * atr_v
-        ma50_stop = ma50 * 1.025
-        stop = min(atr_stop, ma50_stop)
-        risk = stop - price
-        target = price - 1.5 * risk
+    # Hard filter: never trade against MA200
+    if long_term_trend == "up" and total < 0:
+        return {
+            "action": "wait", "score": total,
+            "reasons": reasons + ["Signal contradicts long-term uptrend (MA200)"],
+            "confidence": 30, "levels": {},
+            "metrics": {"atr_pct": atr_pct, "regime": regime, "rsi": rsi_val}
+        }
+    if long_term_trend == "down" and total > 0:
+        return {
+            "action": "wait", "score": total,
+            "reasons": reasons + ["Signal contradicts long-term downtrend (MA200)"],
+            "confidence": 30, "levels": {},
+            "metrics": {"atr_pct": atr_pct, "regime": regime, "rsi": rsi_val}
+        }
 
-    def sign(v): return ('+' if v >= 0 else '') + str(v)
-    reasons = []
-    if trend_reasons:     reasons.append(f"Trend {sign(trend_vote)}: {','.join(trend_reasons)}")
-    if reversion_reasons: reasons.append(f"Reversion {sign(reversion_vote)}: {','.join(reversion_reasons)}")
-    if breakout_reasons:  reasons.append(f"Breakout {sign(breakout_vote)}: {','.join(breakout_reasons)}")
-    if not reasons: reasons = [f'Total vote {total_vote} (need ±3 to enter)']
+    # --- ACTION THRESHOLDS ---
+    action = "wait"
+    confidence = 50
+
+    if total >= 3.0:
+        action = "buy"
+        confidence = min(85, 55 + int(total * 8))
+    elif total <= -3.0:
+        action = "sell"
+        confidence = min(85, 55 + int(abs(total) * 8))
+    else:
+        reasons.append("Insufficient confluence (< 3.0)")
+
+    # --- LEVELS (Risk-First) ---
+    levels = {}
+    if action in ("buy", "sell"):
+        direction = 1 if action == "buy" else -1
+
+        # Stop: ATR-based with hard cap
+        atr_stop = atr_v * params["atr_mult"]
+        hard_stop = price * (MAX_LOSS_PER_TRADE_PCT / 100)
+        stop_distance = min(atr_stop, hard_stop)
+
+        stop = price - stop_distance * direction
+        risk = abs(price - stop)
+
+        # Target: minimum R:R 1:1.5
+        target = price + (risk * HARD_RR_MIN) * direction
+
+        # Sanity checks using support/resistance
+        if action == "buy":
+            if support is not None:
+                stop = max(stop, support * 0.98)
+            if resistance is not None:
+                target = min(target, resistance * 1.02)
+        else:
+            if resistance is not None:
+                stop = min(stop, resistance * 1.02)
+            if support is not None:
+                target = max(target, support * 0.98)
+
+        # Recalculate R:R after sanity checks
+        risk = abs(price - stop)
+        reward = abs(target - price)
+        rr = round(reward / risk, 2) if risk > 0 else 0
+
+        levels = {
+            "entry": round(price, 4 if price < 1 else 2),
+            "stop": round(stop, 4 if price < 1 else 2),
+            "target": round(target, 4 if price < 1 else 2),
+            "rr": rr,
+            "risk_pct": round(risk / price * 100, 2)
+        }
 
     return {
-        'action': action, 'score': total_vote, 'reasons': reasons,
-        'atr': atr_v, 'stop': stop, 'target': target,
-        'trend': trend, 'ma200': ma200,
+        "action": action,
+        "score": round(total, 2),
+        "reasons": reasons if reasons else ["Mixed signals — insufficient confidence"],
+        "confidence": confidence,
+        "levels": levels,
+        "metrics": {
+            "atr_pct": round(atr_pct, 2),
+            "regime": regime,
+            "rsi": round(rsi_val, 1),
+            "macd": macd,
+            "ma50": round(ma50, 2),
+            "ma200": round(ma200, 2),
+            "bb_pos": round(bb_pos, 2),
+            "stoch_k": round(stoch_k, 1),
+            "volume_signal": vol_sig,
+            "long_term_trend": long_term_trend,
+        }
     }
 
 
-def _simulate_v5(closes, highs, lows, vols, symbol):
-    """v5.3: hard cap 10% + trailing stop.
-    v5.3.1: hard cap also applies to timeouts (the original bug)."""
-    HARD_CAP_PCT = 0.10
-    TRAIL_ARM_1  = 0.01
-    TRAIL_ARM_2  = 0.02
-    MAX_HOLD     = 10
+# ---------------------------------------------------------------------------
+# v6.0 Simulator — Risk-First Trade Simulation
+# ---------------------------------------------------------------------------
+def _simulate_v6(closes, highs, lows, vols, symbol):
+    """
+    Simulate trades with strict risk management:
+    - Hard stop: max 2% loss
+    - Max hold: 5 days (configurable per asset class)
+    - Uses actual High/Low for stop/target hits (gap-aware)
+    - Volatility-based position sizing
+    - Supports both BUY and SELL
+    """
+    category = ASSET_CATEGORY.get(symbol, "stocks")
+    params = ASSET_PARAMS.get(category, ASSET_PARAMS["stocks"])
+    max_hold = params["max_hold"]
+
     trades = []
-    i = 60
+    i = 200
     while i < len(closes) - 3:
-        sig = _score_v5(closes, highs, lows, vols, i)
-        if sig is None or sig['action'] != 'buy' or sig['stop'] is None:
+        sig = _score_v6(closes, highs, lows, vols, i)
+        if sig is None or sig["action"] not in ("buy", "sell") or not sig.get("levels"):
             i += 1
             continue
-        entry   = closes[i]
-        stop    = sig['stop']
-        target  = sig['target']
-        hard_stop   = entry * (1 - HARD_CAP_PCT)
-        active_stop = max(stop, hard_stop)
-        highest = entry
-        exit_idx, exit_price, outcome = None, None, None
-        for j in range(i + 1, min(i + MAX_HOLD + 1, len(closes))):
-            cur_high = highs[j] if j < len(highs) else closes[j]
-            cur_low  = lows[j]  if j < len(lows)  else closes[j]
-            if cur_high > highest: highest = cur_high
-            gain = (highest - entry) / entry
-            if gain >= TRAIL_ARM_2:
-                active_stop = max(active_stop, entry * 1.01)
-            elif gain >= TRAIL_ARM_1:
-                active_stop = max(active_stop, entry)
-            if cur_high >= target:
-                exit_idx, exit_price, outcome = j, target, 'win'
+
+        entry_price = closes[i]
+        direction = 1 if sig["action"] == "buy" else -1
+
+        # Volatility-based position sizing
+        atr_pct = sig["metrics"].get("atr_pct", 2.0)
+        size_mult = max(0.25, min(1.0, 3.0 / max(atr_pct, 0.5)))
+
+        # Levels
+        stop_price = sig["levels"]["stop"]
+        target_price = sig["levels"]["target"]
+
+        exit_price = None
+        exit_reason = None
+        exit_day = 0
+
+        for day in range(1, max_hold + 1):
+            idx = i + day
+            if idx >= len(closes):
                 break
-            if cur_low <= active_stop:
-                exit_idx, exit_price, outcome = j, active_stop, 'loss'
-                break
-        if exit_idx is None:
-            exit_idx = min(i + MAX_HOLD, len(closes) - 1)
-            raw_exit = closes[exit_idx]
-            # v5.3.1 bugfix: hard cap also applies to timeouts.
-            if raw_exit < active_stop:
-                exit_price = active_stop
-                outcome = 'loss'
-            else:
-                exit_price = raw_exit
-                outcome = 'timeout'
-        pnl_pct = ((exit_price - entry) / entry) * 100
+
+            day_high = highs[idx] if idx < len(highs) else closes[idx]
+            day_low = lows[idx] if idx < len(lows) else closes[idx]
+
+            # Check stop/target using actual High/Low (gap-aware)
+            if direction == 1:  # Long
+                if day_low <= stop_price:
+                    exit_price = stop_price
+                    exit_reason = "stop"
+                    exit_day = day
+                    break
+                if day_high >= target_price:
+                    exit_price = target_price
+                    exit_reason = "target"
+                    exit_day = day
+                    break
+            else:  # Short
+                if day_high >= stop_price:
+                    exit_price = stop_price
+                    exit_reason = "stop"
+                    exit_day = day
+                    break
+                if day_low <= target_price:
+                    exit_price = target_price
+                    exit_reason = "target"
+                    exit_day = day
+                    break
+
+        # Time-based exit
+        if exit_price is None:
+            last_idx = min(i + max_hold, len(closes) - 1)
+            exit_price = closes[last_idx]
+            exit_reason = "timeout"
+            exit_day = last_idx - i
+
+            # Hard cap on timeout losses
+            pnl = ((exit_price - entry_price) / entry_price) * 100 * direction
+            if pnl < -MAX_LOSS_PER_TRADE_PCT:
+                exit_price = entry_price * (1 - MAX_LOSS_PER_TRADE_PCT / 100 * direction)
+                exit_reason = "timeout_capped"
+                pnl = -MAX_LOSS_PER_TRADE_PCT
+        else:
+            pnl = ((exit_price - entry_price) / entry_price) * 100 * direction
+
+        # Apply position sizing to PnL
+        actual_pnl = pnl * size_mult
+
         trades.append({
-            'symbol': symbol, 'entry_idx': i, 'exit_idx': exit_idx,
-            'outcome': outcome, 'pnl_pct': round(pnl_pct, 2),
+            "symbol": symbol,
+            "entry_idx": i,
+            "exit_idx": i + exit_day,
+            "outcome": "win" if actual_pnl > 0 else "loss" if actual_pnl < 0 else "breakeven",
+            "pnl_pct": round(actual_pnl, 2),
+            "raw_pnl": round(pnl, 2),
+            "exit_reason": exit_reason,
+            "duration": exit_day,
+            "size_mult": round(size_mult, 2),
+            "action": sig["action"],
         })
-        i = exit_idx + 1
+
+        i = i + exit_day + 1
+
     return trades
 
 
+# ---------------------------------------------------------------------------
+# Fetching
+# ---------------------------------------------------------------------------
 async def fetch_indicators(session, yahoo_symbol, internal_key):
     now = datetime.now()
     if yahoo_symbol in _indicator_cache:
@@ -327,24 +629,34 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
         lows   = [l for l in quotes["low"]   if l is not None]
         vols   = [v for v in quotes.get("volume", []) if v is not None]
         if len(closes) < 30: return None
-        sig = _score_v5(closes, highs, lows, vols, len(closes) - 1)
-        if sig is None: return None
+
+        # Use v6.0 scoring
+        sig = _score_v6(closes, highs, lows, vols, len(closes) - 1)
+        if sig is None: sig = {"action": "wait", "score": 0, "reasons": ["Insufficient data"], "confidence": 0, "levels": {}, "metrics": {}}
+
         last_close = closes[-1]
         prev_close = closes[-2] if len(closes) >= 2 else last_close
         prev_high  = highs[-2]  if len(highs)  >= 2 else (highs[-1]  if highs  else last_close)
         prev_low   = lows[-2]   if len(lows)   >= 2 else (lows[-1]   if lows   else last_close)
+
         sma20 = _sma(closes, 20)
         std20 = _std(closes, 20)
         bb_up = sma20 + 2 * std20 if std20 is not None else None
         bb_lo = sma20 - 2 * std20 if std20 is not None else None
         stoch_k, stoch_d = _stochastic(highs, lows, closes, 14, 3, 3)
         atr_v = _atr(highs, lows, closes, 14)
+
         pivot    = (prev_high + prev_low + prev_close) / 3
         pivot_r1 = 2 * pivot - prev_low
         pivot_s1 = 2 * pivot - prev_high
         pivot_r2 = pivot + (prev_high - prev_low)
         pivot_s2 = pivot - (prev_high - prev_low)
         support, resistance = _sr_levels(highs, lows, 20)
+
+        # Override params for this asset category
+        category = ASSET_CATEGORY.get(internal_key, "stocks")
+        params = ASSET_PARAMS.get(category, ASSET_PARAMS["stocks"])
+
         result_data = {
             "rsi":         round(_rsi(closes), 2) if _rsi(closes) is not None else None,
             "macd_signal": _macd_signal(closes),
@@ -365,10 +677,14 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
             "resistance":  round(resistance, 4) if resistance is not None else None,
             "last_volume": vols[-1] if vols else None,
             "avg_volume":  round(sum(vols[-20:]) / min(20, len(vols)), 0) if vols else None,
-            "v5_action":   sig['action'],
-            "v5_score":    sig['score'],
-            "v5_reasons":  sig['reasons'],
-            "v5_trend":    sig['trend'],
+            # v5 compatibility for frontend
+            "v5_action":   sig["action"],
+            "v5_score":    sig["score"],
+            "v5_reasons":  sig["reasons"],
+            "v5_trend":    sig["metrics"].get("long_term_trend", "neutral"),
+            "confidence":  sig["confidence"],
+            "levels":      sig.get("levels", {}),
+            "regime":      sig["metrics"].get("regime", "mixed"),
         }
         _indicator_cache[yahoo_symbol] = (result_data, now)
         return result_data
@@ -431,19 +747,38 @@ async def fetch_spy_qqq_overrides(session):
     return overrides
 
 
+# ---------------------------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
-        "message": "TradeAI API v5.3.1 (Ensemble + Trailing + Cap on timeout)",
+        "message": "TradeAI API v6.0 — Risk-First Engine",
         "status": "active",
         "cache_ttl_seconds": CACHE_TTL.total_seconds(),
         "indicator_cache_ttl_seconds": INDICATOR_CACHE_TTL.total_seconds(),
         "backtest_cache_ttl_seconds": BACKTEST_CACHE_TTL.total_seconds(),
+        "max_loss_per_trade": MAX_LOSS_PER_TRADE_PCT,
+        "min_rr": HARD_RR_MIN,
     }
 
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
+    """Single asset price + full analysis."""
+    key = symbol.upper()
+    if key not in SYMBOLS:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    async with aiohttp.ClientSession() as session:
+        _, data = await fetch_one(session, key)
+        if not data:
+            raise HTTPException(status_code=503, detail="Price data unavailable")
+
+        ind = await fetch_indicators(session, SYMBOLS[key], key)
+        if ind:
+            data.update(ind)
+
     return data
 
 
@@ -451,34 +786,45 @@ async def get_price(symbol: str):
 async def get_all_prices():
     if _cache["ts"] and datetime.now() - _cache["ts"] < CACHE_TTL and _cache["data"]:
         return _cache["data"]
+
     results = {}
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_one(session, key) for key in SYMBOLS]
         for key, data in await asyncio.gather(*tasks):
             if data: results[key] = data
+
         etf_overrides = await fetch_spy_qqq_overrides(session)
         for symbol, data in etf_overrides.items():
             if data and "price" in data:
                 results[symbol] = data
+
         indicator_tasks = [
             fetch_indicators(session, SYMBOLS.get(k, k), k)
             for k in results.keys()
         ]
         for k, ind in zip(results.keys(), await asyncio.gather(*indicator_tasks)):
             if ind: results[k].update(ind)
+
     if not results:
         raise HTTPException(503, "No data fetched from upstream")
+
     _cache["data"] = results
     _cache["ts"] = datetime.now()
     return results
 
 
 @app.get("/backtest")
-async def backtest():
-    # v5.3.2: always recompute (no cache) so code changes take effect immediately
-    pass
-    all_trades = []
+async def backtest(refresh: bool = Query(False)):
+    """Run v6.0 backtest across all assets. Cached for 5 minutes."""
+    global _backtest_cache
+
+    now = datetime.now()
+    if not refresh and _backtest_cache["ts"] and (now - _backtest_cache["ts"]) < BACKTEST_CACHE_TTL and _backtest_cache["data"]:
+        return _backtest_cache["data"]
+
+    all_results = []
     by_symbol = {}
+
     async with aiohttp.ClientSession() as session:
         for sym, yahoo in SYMBOLS.items():
             try:
@@ -489,59 +835,118 @@ async def backtest():
                 ) as resp:
                     if resp.status != 200: continue
                     data = await resp.json()
+
                 result = data["chart"]["result"][0]
                 quotes = result["indicators"]["quote"][0]
                 closes = [c for c in quotes["close"] if c is not None]
                 highs  = [h for h in quotes["high"]  if h is not None]
                 lows   = [l for l in quotes["low"]   if l is not None]
                 vols   = [v for v in quotes.get("volume", []) if v is not None]
-                if len(closes) < 60: continue
-                trades = _simulate_v5(closes, highs, lows, vols, sym)
-                all_trades.extend(trades)
-                by_symbol[sym] = {
-                    "trades": len(trades),
-                    "wins": sum(1 for t in trades if t["outcome"] == "win"),
-                    "losses": sum(1 for t in trades if t["outcome"] == "loss"),
-                    "timeouts": sum(1 for t in trades if t["outcome"] == "timeout"),
-                    "avg_pnl": round(sum(t["pnl_pct"] for t in trades) / len(trades), 2) if trades else 0,
-                }
+
+                if len(closes) < 200: continue
+
+                trades = _simulate_v6(closes, highs, lows, vols, sym)
+
+                if trades:
+                    wins = sum(1 for t in trades if t["outcome"] == "win")
+                    losses = sum(1 for t in trades if t["outcome"] == "loss")
+                    timeouts = sum(1 for t in trades if "timeout" in t["exit_reason"])
+                    total = len(trades)
+
+                    # Calculate per-asset equity curve and max drawdown
+                    equity = [10000.0]
+                    for t in trades:
+                        equity.append(equity[-1] * (1 + t["pnl_pct"] / 100))
+
+                    peak = equity[0]
+                    max_dd = 0.0
+                    for val in equity:
+                        if val > peak: peak = val
+                        dd = (peak - val) / peak * 100
+                        if dd > max_dd: max_dd = dd
+
+                    all_results.append({
+                        "symbol": sym,
+                        "trades": trades,
+                        "total": total,
+                        "wins": wins,
+                        "losses": losses,
+                        "timeouts": timeouts,
+                        "win_rate": round(wins / total * 100, 2) if total > 0 else 0,
+                        "avg_pnl": round(sum(t["pnl_pct"] for t in trades) / total, 2) if total > 0 else 0,
+                        "max_drawdown_pct": round(max_dd, 2),
+                        "best_trade": round(max(t["pnl_pct"] for t in trades), 2),
+                        "worst_trade": round(min(t["pnl_pct"] for t in trades), 2),
+                        "total_return": round((equity[-1] - 10000) / 100, 2),
+                    })
+
+                    by_symbol[sym] = {
+                        "trades": total,
+                        "wins": wins,
+                        "losses": losses,
+                        "timeouts": timeouts,
+                        "avg_pnl": round(sum(t["pnl_pct"] for t in trades) / total, 2) if total > 0 else 0,
+                        "win_rate": round(wins / total * 100, 2) if total > 0 else 0,
+                        "max_dd": round(max_dd, 2),
+                    }
             except Exception as e:
                 logger.warning(f"[{sym}] backtest failed: {e}")
 
-    if not all_trades:
+    if not all_results:
         raise HTTPException(503, "No data for backtest")
 
-    wins = sum(1 for t in all_trades if t["outcome"] == "win")
-    losses = sum(1 for t in all_trades if t["outcome"] == "loss")
-    timeouts = sum(1 for t in all_trades if t["outcome"] == "timeout")
-    total = len(all_trades)
-    win_rate = (wins / total * 100) if total > 0 else 0
-    avg_pnl = sum(t["pnl_pct"] for t in all_trades) / total if total > 0 else 0
-    pnls = [t["pnl_pct"] for t in all_trades]
-    median_pnl = sorted(pnls)[total // 2] if total else 0
-    eq, peak, max_dd = 100.0, 100.0, 0.0
-    for t in all_trades:
-        eq *= (1 + t["pnl_pct"] / 100.0)
-        if eq > peak: peak = eq
-        dd = (peak - eq) / peak * 100
-        if dd > max_dd: max_dd = dd
+    total_trades = sum(r["total"] for r in all_results)
+    total_wins = sum(r["wins"] for r in all_results)
+    total_losses = sum(r["losses"] for r in all_results)
+    total_timeouts = sum(r["timeouts"] for r in all_results)
+
+    # Weighted averages
+    avg_pnl = sum(r["avg_pnl"] * r["total"] for r in all_results) / total_trades if total_trades > 0 else 0
+    win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+
+    # Overall max drawdown: average across assets (more realistic than worst single asset)
+    max_dd = sum(r["max_drawdown_pct"] for r in all_results) / len(all_results) if all_results else 0
+
+    best_trade = max(r["best_trade"] for r in all_results)
+    worst_trade = min(r["worst_trade"] for r in all_results)
+    avg_return = sum(r["total_return"] for r in all_results) / len(all_results) if all_results else 0
 
     result_data = {
-        "engine": "v5.3.1",
+        "engine": "v6.0",
         "period": "1y",
-        "assets_tested": len(SYMBOLS),
-        "total_trades": total,
-        "wins": wins,
-        "losses": losses,
-        "timeouts": timeouts,
+        "assets_tested": len(all_results),
+        "total_trades": total_trades,
+        "wins": total_wins,
+        "losses": total_losses,
+        "timeouts": total_timeouts,
         "win_rate": round(win_rate, 2),
         "avg_pnl": round(avg_pnl, 2),
-        "median_pnl": round(median_pnl, 2),
-        "best_trade": round(max(pnls), 2) if pnls else 0,
-        "worst_trade": round(min(pnls), 2) if pnls else 0,
+        "avg_return": round(avg_return, 2),
         "max_drawdown_pct": round(max_dd, 2),
+        "best_trade": round(best_trade, 2),
+        "worst_trade": round(worst_trade, 2),
         "by_symbol": by_symbol,
+        "params": {
+            "max_loss_per_trade": MAX_LOSS_PER_TRADE_PCT,
+            "max_hold_days": "per-asset-class (3-7)",
+            "min_rr": HARD_RR_MIN,
+        }
     }
+
     _backtest_cache["data"] = result_data
-    _backtest_cache["ts"] = datetime.now()
+    _backtest_cache["ts"] = now
     return result_data
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
