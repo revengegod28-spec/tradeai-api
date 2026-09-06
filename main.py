@@ -294,9 +294,9 @@ def _volume_signal(vols):
 # ---------------------------------------------------------------------------
 # v6.0 Scoring Engine — Confluence + Trend Filter + Regime
 # ---------------------------------------------------------------------------
-def _score_v6(closes, highs, lows, vols, i):
+def _score_v6(closes, highs, lows, vols, i, category="stocks"):
     """
-    v6.0 Risk-First Scoring Engine.
+    v6.0.1 Risk-First Scoring Engine (per-asset params).
     Returns dict with action, score, reasons, confidence, levels, metrics.
     """
     if i < 200: return None
@@ -307,9 +307,8 @@ def _score_v6(closes, highs, lows, vols, i):
     win_v  = vols[:i + 1]  if vols else None
     price  = window[-1]
 
-    # Detect asset category from symbol context (we'll pass it in properly in the caller)
-    # For now, use default params
-    params = ASSET_PARAMS["stocks"]  # default, will be overridden
+    # v6.0.1: per-asset params (was hardcoded to stocks in v6.0)
+    params = ASSET_PARAMS.get(category, ASSET_PARAMS["stocks"])
 
     # Core indicators
     ma50 = _sma(window, 50)
@@ -515,7 +514,8 @@ def _simulate_v6(closes, highs, lows, vols, symbol):
     trades = []
     i = 200
     while i < len(closes) - 3:
-        sig = _score_v6(closes, highs, lows, vols, i)
+        # v6.0.1: pass category so per-asset params are used
+        sig = _score_v6(closes, highs, lows, vols, i, category=category)
         if sig is None or sig["action"] not in ("buy", "sell") or not sig.get("levels"):
             i += 1
             continue
@@ -630,8 +630,9 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
         vols   = [v for v in quotes.get("volume", []) if v is not None]
         if len(closes) < 30: return None
 
-        # Use v6.0 scoring
-        sig = _score_v6(closes, highs, lows, vols, len(closes) - 1)
+        # v6.0.1: use per-asset params (was hardcoded to stocks)
+        cat = ASSET_CATEGORY.get(internal_key, "stocks")
+        sig = _score_v6(closes, highs, lows, vols, len(closes) - 1, category=cat)
         if sig is None: sig = {"action": "wait", "score": 0, "reasons": ["Insufficient data"], "confidence": 0, "levels": {}, "metrics": {}}
 
         last_close = closes[-1]
