@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-TradeAI Backend v6.0 — Risk-First Engine
+TradeAI Backend v6.0.2 — Risk-First Engine + Robust Fetcher
 FastAPI backend for technical analysis, live prices, and backtesting.
 
-Key v6.0 changes:
+v6.0.2 changes (from v6.0.1):
+- Yahoo Finance fetcher: retry on 429/5xx with backoff
+- Backtest: 0.3s delay between Yahoo requests to avoid rate limiting
+- Backtest: detailed fetch stats (requested/fetched/short/no-trades)
+- Backtest: 8s per-request timeout (was 15s) — fail fast
+- Backtest: 2 retries with exponential backoff (1s, 2s)
+- _score_v6: per-asset params (category parameter) — was hardcoded stocks
+
+Key v6.0 changes (kept):
 - Hard stop loss capped at 2% per trade (was 10%)
-- Max hold reduced to 5 days (was 10)
+- Max hold per asset class (3-7 days)
 - Volatility-based position sizing
 - Trend filter (MA200) — no trading against long-term trend
 - Market regime detection (ADX-based)
@@ -25,7 +33,6 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
 import aiohttp
-import asyncio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tradeai-api")
@@ -37,7 +44,7 @@ from fastapi.responses import JSONResponse
 # ---------------------------------------------------------------------------
 # App Setup
 # ---------------------------------------------------------------------------
-app = FastAPI(title="TradeAI API v6.0", version="6.0.0")
+app = FastAPI(title="TradeAI API v6.0.2", version="6.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,6 +61,10 @@ HEADERS = {
 CACHE_TTL = timedelta(seconds=25)
 INDICATOR_CACHE_TTL = timedelta(minutes=15)
 BACKTEST_CACHE_TTL = timedelta(minutes=5)
+# v6.0.2: Yahoo rate-limit protection
+BACKTEST_REQUEST_DELAY = 0.3   # seconds between backtest requests
+BACKTEST_TIMEOUT = 8           # per-request timeout (was 15)
+BACKTEST_MAX_RETRIES = 2       # retries on 429/5xx
 
 # ---------------------------------------------------------------------------
 # Risk Limits — THE MOST IMPORTANT PART
@@ -748,13 +759,59 @@ async def fetch_spy_qqq_overrides(session):
     return overrides
 
 
+# v6.0.2: Robust Yahoo fetcher with retry on rate limits / transient errors
+async def fetch_yahoo_chart_with_retry(session, yahoo_symbol, max_retries=None):
+    """
+    Fetch Yahoo chart data with exponential-backoff retry.
+    Retries on HTTP 429/5xx and on aiohttp/asyncio errors.
+    Returns parsed JSON dict on success, or None on permanent failure.
+    """
+    if max_retries is None:
+        max_retries = BACKTEST_MAX_RETRIES
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+    for attempt in range(max_retries + 1):
+        try:
+            async with session.get(
+                url,
+                params={"interval": "1d", "range": "1y"},
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=BACKTEST_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                if resp.status in (429, 500, 502, 503, 504):
+                    wait = 0.5 * (2 ** attempt)  # 0.5s, 1.0s, 2.0s
+                    logger.warning(
+                        f"[{yahoo_symbol}] HTTP {resp.status} — "
+                        f"retry {attempt + 1}/{max_retries} in {wait:.1f}s"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                # Other 4xx (400, 401, 403, 404): don't retry
+                logger.warning(f"[{yahoo_symbol}] HTTP {resp.status} — not retrying")
+                return None
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            wait = 0.5 * (2 ** attempt)
+            logger.warning(
+                f"[{yahoo_symbol}] fetch error ({type(e).__name__}) — "
+                f"retry {attempt + 1}/{max_retries} in {wait:.1f}s"
+            )
+            await asyncio.sleep(wait)
+            continue
+        except Exception as e:
+            logger.warning(f"[{yahoo_symbol}] unexpected error: {e}")
+            return None
+    logger.error(f"[{yahoo_symbol}] failed after {max_retries + 1} attempts")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
-        "message": "TradeAI API v6.0 — Risk-First Engine",
+        "message": "TradeAI API v6.0.2 — Risk-First Engine + Robust Fetcher",
         "status": "active",
         "cache_ttl_seconds": CACHE_TTL.total_seconds(),
         "indicator_cache_ttl_seconds": INDICATOR_CACHE_TTL.total_seconds(),
@@ -816,7 +873,7 @@ async def get_all_prices():
 
 @app.get("/backtest")
 async def backtest(refresh: bool = Query(False)):
-    """Run v6.0 backtest across all assets. Cached for 5 minutes."""
+    """Run v6.0.2 backtest across all assets. Cached for 5 minutes."""
     global _backtest_cache
 
     now = datetime.now()
@@ -825,17 +882,29 @@ async def backtest(refresh: bool = Query(False)):
 
     all_results = []
     by_symbol = {}
+    fetch_stats = {
+        "requested": 0,
+        "fetched": 0,
+        "short_data": 0,
+        "fetch_failed": 0,
+        "no_trades": 0,
+        "failed_symbols": [],
+    }
 
     async with aiohttp.ClientSession() as session:
-        for sym, yahoo in SYMBOLS.items():
+        for idx, (sym, yahoo) in enumerate(SYMBOLS.items()):
+            fetch_stats["requested"] += 1
+
+            # v6.0.2: rate-limit protection — sleep between requests
+            if idx > 0:
+                await asyncio.sleep(BACKTEST_REQUEST_DELAY)
+
             try:
-                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo}"
-                async with session.get(
-                    url, params={"interval": "1d", "range": "1y"},
-                    headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200: continue
-                    data = await resp.json()
+                data = await fetch_yahoo_chart_with_retry(session, yahoo)
+                if data is None:
+                    fetch_stats["fetch_failed"] += 1
+                    fetch_stats["failed_symbols"].append(sym)
+                    continue
 
                 result = data["chart"]["result"][0]
                 quotes = result["indicators"]["quote"][0]
@@ -844,57 +913,74 @@ async def backtest(refresh: bool = Query(False)):
                 lows   = [l for l in quotes["low"]   if l is not None]
                 vols   = [v for v in quotes.get("volume", []) if v is not None]
 
-                if len(closes) < 200: continue
+                fetch_stats["fetched"] += 1
+
+                if len(closes) < 200:
+                    fetch_stats["short_data"] += 1
+                    logger.info(f"[{sym}] only {len(closes)} days — need 200+ for MA200")
+                    continue
 
                 trades = _simulate_v6(closes, highs, lows, vols, sym)
 
-                if trades:
-                    wins = sum(1 for t in trades if t["outcome"] == "win")
-                    losses = sum(1 for t in trades if t["outcome"] == "loss")
-                    timeouts = sum(1 for t in trades if "timeout" in t["exit_reason"])
-                    total = len(trades)
+                if not trades:
+                    fetch_stats["no_trades"] += 1
+                    logger.info(f"[{sym}] no trades generated (signals never met thresholds)")
+                    continue
 
-                    # Calculate per-asset equity curve and max drawdown
-                    equity = [10000.0]
-                    for t in trades:
-                        equity.append(equity[-1] * (1 + t["pnl_pct"] / 100))
+                wins = sum(1 for t in trades if t["outcome"] == "win")
+                losses = sum(1 for t in trades if t["outcome"] == "loss")
+                timeouts = sum(1 for t in trades if "timeout" in t["exit_reason"])
+                total = len(trades)
 
-                    peak = equity[0]
-                    max_dd = 0.0
-                    for val in equity:
-                        if val > peak: peak = val
-                        dd = (peak - val) / peak * 100
-                        if dd > max_dd: max_dd = dd
+                # Calculate per-asset equity curve and max drawdown
+                equity = [10000.0]
+                for t in trades:
+                    equity.append(equity[-1] * (1 + t["pnl_pct"] / 100))
 
-                    all_results.append({
-                        "symbol": sym,
-                        "trades": trades,
-                        "total": total,
-                        "wins": wins,
-                        "losses": losses,
-                        "timeouts": timeouts,
-                        "win_rate": round(wins / total * 100, 2) if total > 0 else 0,
-                        "avg_pnl": round(sum(t["pnl_pct"] for t in trades) / total, 2) if total > 0 else 0,
-                        "max_drawdown_pct": round(max_dd, 2),
-                        "best_trade": round(max(t["pnl_pct"] for t in trades), 2),
-                        "worst_trade": round(min(t["pnl_pct"] for t in trades), 2),
-                        "total_return": round((equity[-1] - 10000) / 100, 2),
-                    })
+                peak = equity[0]
+                max_dd = 0.0
+                for val in equity:
+                    if val > peak: peak = val
+                    dd = (peak - val) / peak * 100
+                    if dd > max_dd: max_dd = dd
 
-                    by_symbol[sym] = {
-                        "trades": total,
-                        "wins": wins,
-                        "losses": losses,
-                        "timeouts": timeouts,
-                        "avg_pnl": round(sum(t["pnl_pct"] for t in trades) / total, 2) if total > 0 else 0,
-                        "win_rate": round(wins / total * 100, 2) if total > 0 else 0,
-                        "max_dd": round(max_dd, 2),
-                    }
+                all_results.append({
+                    "symbol": sym,
+                    "trades": trades,
+                    "total": total,
+                    "wins": wins,
+                    "losses": losses,
+                    "timeouts": timeouts,
+                    "win_rate": round(wins / total * 100, 2) if total > 0 else 0,
+                    "avg_pnl": round(sum(t["pnl_pct"] for t in trades) / total, 2) if total > 0 else 0,
+                    "max_drawdown_pct": round(max_dd, 2),
+                    "best_trade": round(max(t["pnl_pct"] for t in trades), 2),
+                    "worst_trade": round(min(t["pnl_pct"] for t in trades), 2),
+                    "total_return": round((equity[-1] - 10000) / 100, 2),
+                })
+
+                by_symbol[sym] = {
+                    "trades": total,
+                    "wins": wins,
+                    "losses": losses,
+                    "timeouts": timeouts,
+                    "avg_pnl": round(sum(t["pnl_pct"] for t in trades) / total, 2) if total > 0 else 0,
+                    "win_rate": round(wins / total * 100, 2) if total > 0 else 0,
+                    "max_dd": round(max_dd, 2),
+                }
             except Exception as e:
                 logger.warning(f"[{sym}] backtest failed: {e}")
+                fetch_stats["fetch_failed"] += 1
+                fetch_stats["failed_symbols"].append(sym)
+
+    logger.info(
+        f"Backtest done: requested={fetch_stats['requested']} "
+        f"fetched={fetch_stats['fetched']} short={fetch_stats['short_data']} "
+        f"no_trades={fetch_stats['no_trades']} failed={fetch_stats['fetch_failed']}"
+    )
 
     if not all_results:
-        raise HTTPException(503, "No data for backtest")
+        raise HTTPException(503, f"No data for backtest (stats: {fetch_stats})")
 
     total_trades = sum(r["total"] for r in all_results)
     total_wins = sum(r["wins"] for r in all_results)
@@ -913,7 +999,7 @@ async def backtest(refresh: bool = Query(False)):
     avg_return = sum(r["total_return"] for r in all_results) / len(all_results) if all_results else 0
 
     result_data = {
-        "engine": "v6.0",
+        "engine": "v6.0.2",
         "period": "1y",
         "assets_tested": len(all_results),
         "total_trades": total_trades,
@@ -927,6 +1013,7 @@ async def backtest(refresh: bool = Query(False)):
         "best_trade": round(best_trade, 2),
         "worst_trade": round(worst_trade, 2),
         "by_symbol": by_symbol,
+        "fetch_stats": fetch_stats,
         "params": {
             "max_loss_per_trade": MAX_LOSS_PER_TRADE_PCT,
             "max_hold_days": "per-asset-class (3-7)",
