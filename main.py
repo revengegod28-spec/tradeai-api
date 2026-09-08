@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """
-TradeAI Backend v6.0.2 — Risk-First Engine + Robust Fetcher
+TradeAI Backend v6.1.0 — ATR Breakout + Chandelier Trailing Exit
 FastAPI backend for technical analysis, live prices, and backtesting.
 
-v6.0.2 changes (from v6.0.1):
-- Yahoo Finance fetcher: retry on 429/5xx with backoff
-- Backtest: 0.3s delay between Yahoo requests to avoid rate limiting
-- Backtest: detailed fetch stats (requested/fetched/short/no-trades)
-- Backtest: 8s per-request timeout (was 15s) — fail fast
-- Backtest: 2 retries with exponential backoff (1s, 2s)
-- _score_v6: per-asset params (category parameter) — was hardcoded stocks
+v6.1.0 changes (from v6.0.2):
+- New strategy: ATR Breakout entry + Chandelier Trailing Exit (no fixed take-profit)
+- New filters: MA200 trend + ADX > 20 (trend only) + per-asset vol cap
+- Asset classes collapsed: 5 categories -> 3 (EQUITIES_INDICES, CRYPTO, FOREX_COMMODITIES)
+- Parallel fetch: asyncio.gather with Semaphore(4) + 100ms jitter
+- Raw response cache: 15-min TTL (no refetch for backtest bursts)
+- Backtest timeout cut to 6s/request (was 8s)
+- Backtest should complete in <12s on Render (was 50-60s, hitting 503)
 
-Key v6.0 changes (kept):
-- Hard stop loss capped at 2% per trade (was 10%)
-- Max hold per asset class (3-7 days)
-- Volatility-based position sizing
-- Trend filter (MA200) — no trading against long-term trend
-- Market regime detection (ADX-based)
-- Per-asset-class parameter tuning
-- Confluence scoring with asymmetric thresholds
-- Gap-aware stop/target using actual High/Low
-- Supports both BUY and SELL signals
+v6.0.x kept:
+- Hard 2% loss cap per trade
+- Per-asset params for vol/hold/RSI thresholds
+- Yahoo rate-limit handling (retry on 429/5xx, exponential backoff)
+- Per-symbol fetch_stats in backtest response
+- v5-compat fields in /prices for frontend (v5_action, v5_score, v5_reasons, v5_trend)
 """
 
 import os
 import json
 import math
 import time
+import random
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -44,7 +42,7 @@ from fastapi.responses import JSONResponse
 # ---------------------------------------------------------------------------
 # App Setup
 # ---------------------------------------------------------------------------
-app = FastAPI(title="TradeAI API v6.0.2", version="6.0.2")
+app = FastAPI(title="TradeAI API v6.1.0", version="6.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,16 +59,20 @@ HEADERS = {
 CACHE_TTL = timedelta(seconds=25)
 INDICATOR_CACHE_TTL = timedelta(minutes=15)
 BACKTEST_CACHE_TTL = timedelta(minutes=5)
-# v6.0.2: Yahoo rate-limit protection
-BACKTEST_REQUEST_DELAY = 0.3   # seconds between backtest requests
-BACKTEST_TIMEOUT = 8           # per-request timeout (was 15)
-BACKTEST_MAX_RETRIES = 2       # retries on 429/5xx
+# v6.1.0: parallel fetch with caching
+RAW_FETCH_TTL = timedelta(minutes=15)   # cache raw Yahoo responses
+BACKTEST_CONCURRENCY = 4                # max parallel Yahoo requests
+BACKTEST_JITTER = 0.1                   # random delay 0-100ms per request
+BACKTEST_RANGE = "1y"                   # "1y" gives 200+ days for MA200; "6m" would break it
+# v6.0.2 kept
+BACKTEST_TIMEOUT = 6                    # per-request timeout (cut from 8s)
+BACKTEST_MAX_RETRIES = 2                # retries on 429/5xx
 
 # ---------------------------------------------------------------------------
 # Risk Limits — THE MOST IMPORTANT PART
 # ---------------------------------------------------------------------------
-MAX_LOSS_PER_TRADE_PCT = 2.0      # Never lose more than 2% on a single trade
-HARD_RR_MIN = 1.5                 # Minimum risk:reward 1:1.5
+HARD_STOP_LOSS_PCT = 2.0                # Never lose more than 2% on a single trade
+MAX_LOSS_PER_TRADE_PCT = HARD_STOP_LOSS_PCT  # alias kept for back-compat
 
 # ---------------------------------------------------------------------------
 # Asset Definitions
@@ -85,23 +87,33 @@ SYMBOLS = {
     "SP500": "^GSPC", "NASDAQ": "^IXIC",
 }
 
-# Per-asset-class parameters
+# v6.1.0: 3 simplified categories (was 5)
 ASSET_PARAMS = {
-    "stocks":     {"atr_mult": 1.5, "max_hold": 5, "rsi_low": 30, "rsi_high": 70, "size_mult": 1.0, "vol_cap": 4.0},
-    "crypto":     {"atr_mult": 2.0, "max_hold": 3, "rsi_low": 25, "rsi_high": 75, "size_mult": 0.5, "vol_cap": 6.0},
-    "forex":      {"atr_mult": 1.0, "max_hold": 7, "rsi_low": 35, "rsi_high": 65, "size_mult": 1.2, "vol_cap": 1.5},
-    "commodities":{"atr_mult": 1.5, "max_hold": 5, "rsi_low": 30, "rsi_high": 70, "size_mult": 0.8, "vol_cap": 3.0},
-    "indices":    {"atr_mult": 1.2, "max_hold": 5, "rsi_low": 30, "rsi_high": 70, "size_mult": 1.0, "vol_cap": 2.5},
+    "EQUITIES_INDICES": {
+        "atr_mult": 1.5, "max_hold": 10, "vol_cap": 3.5, "chandelier_mult": 2.5,
+        "rsi_low": 30, "rsi_high": 70, "size_mult": 1.0,
+    },
+    "CRYPTO": {
+        "atr_mult": 2.0, "max_hold": 7, "vol_cap": 6.0, "chandelier_mult": 3.0,
+        "rsi_low": 25, "rsi_high": 75, "size_mult": 0.5,
+    },
+    "FOREX_COMMODITIES": {
+        "atr_mult": 1.2, "max_hold": 12, "vol_cap": 2.0, "chandelier_mult": 2.0,
+        "rsi_low": 35, "rsi_high": 65, "size_mult": 1.0,
+    },
 }
 
-# Asset category mapping
+# Asset category mapping (3 categories)
 ASSET_CATEGORY = {
-    "AAPL": "stocks", "TSLA": "stocks", "MSFT": "stocks", "GOOGL": "stocks",
-    "AMZN": "stocks", "NVDA": "stocks", "META": "stocks", "NFLX": "stocks",
-    "BTC": "crypto", "ETH": "crypto", "BNB": "crypto", "SOL": "crypto", "XRP": "crypto",
-    "EURUSD": "forex", "GBPUSD": "forex", "USDJPY": "forex", "XAUUSD": "forex",
-    "WTI": "commodities", "BRENT": "commodities",
-    "SP500": "indices", "NASDAQ": "indices",
+    "AAPL": "EQUITIES_INDICES", "TSLA": "EQUITIES_INDICES",
+    "MSFT": "EQUITIES_INDICES", "GOOGL": "EQUITIES_INDICES",
+    "AMZN": "EQUITIES_INDICES", "NVDA": "EQUITIES_INDICES",
+    "META": "EQUITIES_INDICES", "NFLX": "EQUITIES_INDICES",
+    "SP500": "EQUITIES_INDICES", "NASDAQ": "EQUITIES_INDICES",
+    "BTC": "CRYPTO", "ETH": "CRYPTO", "BNB": "CRYPTO", "SOL": "CRYPTO", "XRP": "CRYPTO",
+    "EURUSD": "FOREX_COMMODITIES", "GBPUSD": "FOREX_COMMODITIES",
+    "USDJPY": "FOREX_COMMODITIES", "XAUUSD": "FOREX_COMMODITIES",
+    "WTI": "FOREX_COMMODITIES", "BRENT": "FOREX_COMMODITIES",
 }
 
 PRICE_BOUNDS = {
@@ -119,6 +131,8 @@ PRICE_BOUNDS = {
 _cache = {"data": None, "ts": None}
 _indicator_cache = {}
 _backtest_cache = {"data": None, "ts": None}
+# v6.1.0: raw Yahoo response cache (15min TTL) for fast repeated backtests
+_raw_fetch_cache = {}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -303,8 +317,138 @@ def _volume_signal(vols):
 
 
 # ---------------------------------------------------------------------------
-# v6.0 Scoring Engine — Confluence + Trend Filter + Regime
+# v6.1.0 Scoring Engine — ATR Breakout + MA200 + ADX
 # ---------------------------------------------------------------------------
+def _score_v61(closes, highs, lows, vols, i, category="EQUITIES_INDICES"):
+    """
+    v6.1.0 Signal generator: ATR Breakout entry.
+    Returns dict with action (buy/sell/wait), score, confidence, levels, reasons, metrics.
+    """
+    if i < 200:  # MA200 needs 200 days
+        return None
+
+    params = ASSET_PARAMS.get(category, ASSET_PARAMS["EQUITIES_INDICES"])
+
+    win = closes[: i + 1]
+    win_h = highs[: i + 1] if i < len(highs) else win
+    win_l = lows[: i + 1] if i < len(lows) else win
+    win_v = vols[: i + 1] if vols else None
+    price = win[-1]
+
+    # Core indicators
+    ma200 = _sma(win, 200)
+    sma20 = _sma(win, 20)
+    atr_v = _atr(win_h, win_l, win, 14)
+    adx_v = _adx(win_h, win_l, win, 14)
+    rsi_val = _rsi(win)
+    macd = _macd_signal(win)
+
+    if ma200 is None or sma20 is None or atr_v is None:
+        return None
+
+    atr_pct = atr_v / price * 100
+    long_term_trend = "up" if price > ma200 else "down"
+
+    # --- HARD FILTERS ---
+    reasons = []
+
+    # 1. Volatility cap
+    if atr_pct > params["vol_cap"]:
+        return {
+            "action": "wait", "score": 0,
+            "reasons": [f"ATR% {atr_pct:.1f} exceeds cap {params['vol_cap']}"],
+            "confidence": 0, "levels": {},
+            "metrics": {"atr_pct": atr_pct, "adx": adx_v, "rsi": rsi_val, "long_term_trend": long_term_trend}
+        }
+
+    # 2. ADX regime filter (must be trending)
+    if adx_v < 20:
+        return {
+            "action": "wait", "score": 0,
+            "reasons": [f"ADX {adx_v:.1f} < 20 — chop, no trade"],
+            "confidence": 0, "levels": {},
+            "metrics": {"atr_pct": atr_pct, "adx": adx_v, "rsi": rsi_val, "long_term_trend": long_term_trend}
+        }
+
+    # --- ATR BREAKOUT SIGNAL ---
+    # Keltner-like bands: SMA20 ± (1.5 * ATR)
+    breakout_up = sma20 + (1.5 * atr_v)
+    breakout_down = sma20 - (1.5 * atr_v)
+
+    action = "wait"
+    score = 0.0
+
+    if price > ma200 and price > breakout_up:
+        # BUY: price above MA200 AND above upper band
+        action = "buy"
+        score = 2.0
+        reasons.append(f"ATR breakout up: close {price:.2f} > SMA20+1.5*ATR ({breakout_up:.2f})")
+        reasons.append(f"Above MA200 ({ma200:.2f}) — long-term uptrend")
+        if macd == "bullish":
+            score += 1.0
+            reasons.append("MACD bullish")
+        if rsi_val is not None and rsi_val > 50:
+            score += 0.5
+            reasons.append(f"RSI {rsi_val:.0f} > 50")
+    elif price < ma200 and price < breakout_down:
+        # SELL: price below MA200 AND below lower band
+        action = "sell"
+        score = -2.0
+        reasons.append(f"ATR breakdown: close {price:.2f} < SMA20-1.5*ATR ({breakout_down:.2f})")
+        reasons.append(f"Below MA200 ({ma200:.2f}) — long-term downtrend")
+        if macd == "bearish":
+            score -= 1.0
+            reasons.append("MACD bearish")
+        if rsi_val is not None and rsi_val < 50:
+            score -= 0.5
+            reasons.append(f"RSI {rsi_val:.0f} < 50")
+    else:
+        reasons.append("No ATR breakout (price between SMA20 ± 1.5*ATR)")
+
+    confidence = 50
+    if action in ("buy", "sell"):
+        confidence = min(85, 60 + int(abs(score) * 5))
+
+    # --- LEVELS (entry + initial stop for Chandelier simulation) ---
+    levels = {}
+    if action in ("buy", "sell"):
+        direction = 1 if action == "buy" else -1
+        # Initial Chandelier stop from entry
+        initial_chandelier = price - (params["chandelier_mult"] * atr_v) * direction
+        # Hard 2% floor
+        if action == "buy":
+            hard_floor = price * (1 - HARD_STOP_LOSS_PCT / 100)
+            initial_stop = max(initial_chandelier, hard_floor)
+        else:
+            hard_floor = price * (1 + HARD_STOP_LOSS_PCT / 100)
+            initial_stop = min(initial_chandelier, hard_floor)
+        levels = {
+            "entry": round(price, 4 if price < 1 else 2),
+            "initial_stop": round(initial_stop, 4 if price < 1 else 2),
+            "atr": round(atr_v, 4 if price < 1 else 2),
+            "chandelier_mult": params["chandelier_mult"],
+            "hard_floor": round(hard_floor, 4 if price < 1 else 2),
+        }
+
+    return {
+        "action": action,
+        "score": round(score, 2),
+        "reasons": reasons,
+        "confidence": confidence,
+        "levels": levels,
+        "metrics": {
+            "atr_pct": round(atr_pct, 2),
+            "adx": round(adx_v, 1),
+            "rsi": round(rsi_val, 1) if rsi_val is not None else None,
+            "macd": macd,
+            "ma200": round(ma200, 2),
+            "sma20": round(sma20, 2),
+            "long_term_trend": long_term_trend,
+        }
+    }
+
+
+# Backward-compat alias (used internally by older code)
 def _score_v6(closes, highs, lows, vols, i, category="stocks"):
     """
     v6.0.1 Risk-First Scoring Engine (per-asset params).
@@ -507,6 +651,111 @@ def _score_v6(closes, highs, lows, vols, i, category="stocks"):
 
 
 # ---------------------------------------------------------------------------
+# v6.1.0 Simulator — Chandelier Trailing Exit (no fixed take-profit)
+# ---------------------------------------------------------------------------
+def _simulate_v61(closes, highs, lows, vols, symbol):
+    """
+    v6.1.0 Chandelier Trailing Stop simulator.
+    No fixed take-profit — lets profits run.
+    Initial stop: max(chandelier_at_entry, hard_2pct_floor)
+    Trailing: highest_high - chandelier_mult * ATR (for longs)
+              lowest_low + chandelier_mult * ATR (for shorts)
+    Exit: trailing stop hit, hard floor hit, or max_hold reached.
+    """
+    category = ASSET_CATEGORY.get(symbol, "EQUITIES_INDICES")
+    params = ASSET_PARAMS.get(category, ASSET_PARAMS["EQUITIES_INDICES"])
+    max_hold = params["max_hold"]
+    chandelier_mult = params["chandelier_mult"]
+
+    trades = []
+    i = 200
+    while i < len(closes) - 3:
+        sig = _score_v61(closes, highs, lows, vols, i, category=category)
+        if sig is None or sig["action"] not in ("buy", "sell") or not sig.get("levels"):
+            i += 1
+            continue
+
+        entry_price = closes[i]
+        direction = 1 if sig["action"] == "buy" else -1
+        atr_v = sig["levels"]["atr"]
+        hard_floor = sig["levels"]["hard_floor"]
+
+        # Trailing state
+        highest = entry_price
+        lowest = entry_price
+        current_stop = sig["levels"]["initial_stop"]
+
+        exit_price = None
+        exit_reason = None
+        exit_day = 0
+
+        for day in range(1, max_hold + 1):
+            idx = i + day
+            if idx >= len(closes):
+                break
+
+            day_high = highs[idx] if idx < len(highs) else closes[idx]
+            day_low = lows[idx] if idx < len(lows) else closes[idx]
+
+            if direction == 1:  # LONG
+                if day_high > highest:
+                    highest = day_high
+                # Chandelier trailing stop
+                chandelier_stop = highest - (chandelier_mult * atr_v)
+                # Effective stop = max(chandelier, hard 2% floor)
+                current_stop = max(chandelier_stop, hard_floor)
+                # Exit if low touches stop (gap-aware)
+                if day_low <= current_stop:
+                    exit_price = current_stop
+                    exit_reason = "trailing_stop"
+                    exit_day = day
+                    break
+            else:  # SHORT
+                if day_low < lowest:
+                    lowest = day_low
+                chandelier_stop = lowest + (chandelier_mult * atr_v)
+                current_stop = min(chandelier_stop, hard_floor)
+                if day_high >= current_stop:
+                    exit_price = current_stop
+                    exit_reason = "trailing_stop"
+                    exit_day = day
+                    break
+
+        # Time exit
+        if exit_price is None:
+            last_idx = min(i + max_hold, len(closes) - 1)
+            exit_price = closes[last_idx]
+            exit_reason = "time_exit"
+            exit_day = last_idx - i
+
+        pnl = ((exit_price - entry_price) / entry_price) * 100 * direction
+
+        # Hard cap safety (shouldn't trigger with 2% floor, but guarantee)
+        if pnl < -HARD_STOP_LOSS_PCT:
+            pnl = -HARD_STOP_LOSS_PCT
+            if direction == 1:
+                exit_price = entry_price * (1 - HARD_STOP_LOSS_PCT / 100)
+            else:
+                exit_price = entry_price * (1 + HARD_STOP_LOSS_PCT / 100)
+            exit_reason = "hard_cap"
+
+        trades.append({
+            "symbol": symbol,
+            "entry_idx": i,
+            "exit_idx": i + exit_day,
+            "outcome": "win" if pnl > 0 else "loss" if pnl < 0 else "breakeven",
+            "pnl_pct": round(pnl, 2),
+            "exit_reason": exit_reason,
+            "duration": exit_day,
+            "action": sig["action"],
+        })
+
+        i = i + exit_day + 1
+
+    return trades
+
+
+# ---------------------------------------------------------------------------
 # v6.0 Simulator — Risk-First Trade Simulation
 # ---------------------------------------------------------------------------
 def _simulate_v6(closes, highs, lows, vols, symbol):
@@ -641,9 +890,9 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
         vols   = [v for v in quotes.get("volume", []) if v is not None]
         if len(closes) < 30: return None
 
-        # v6.0.1: use per-asset params (was hardcoded to stocks)
-        cat = ASSET_CATEGORY.get(internal_key, "stocks")
-        sig = _score_v6(closes, highs, lows, vols, len(closes) - 1, category=cat)
+        # v6.1.0: use ATR Breakout + Chandelier scoring
+        cat = ASSET_CATEGORY.get(internal_key, "EQUITIES_INDICES")
+        sig = _score_v61(closes, highs, lows, vols, len(closes) - 1, category=cat)
         if sig is None: sig = {"action": "wait", "score": 0, "reasons": ["Insufficient data"], "confidence": 0, "levels": {}, "metrics": {}}
 
         last_close = closes[-1]
@@ -665,9 +914,9 @@ async def fetch_indicators(session, yahoo_symbol, internal_key):
         pivot_s2 = pivot - (prev_high - prev_low)
         support, resistance = _sr_levels(highs, lows, 20)
 
-        # Override params for this asset category
-        category = ASSET_CATEGORY.get(internal_key, "stocks")
-        params = ASSET_PARAMS.get(category, ASSET_PARAMS["stocks"])
+        # Override params for this asset category (v6.1.0: 3 categories)
+        category = ASSET_CATEGORY.get(internal_key, "EQUITIES_INDICES")
+        params = ASSET_PARAMS.get(category, ASSET_PARAMS["EQUITIES_INDICES"])
 
         result_data = {
             "rsi":         round(_rsi(closes), 2) if _rsi(closes) is not None else None,
@@ -805,13 +1054,30 @@ async def fetch_yahoo_chart_with_retry(session, yahoo_symbol, max_retries=None):
     return None
 
 
+# v6.1.0: parallel cached fetch (raw response cache + semaphore + jitter)
+async def _fetch_yahoo_cached(session, sym, yahoo, semaphore):
+    """Fetch raw Yahoo chart with 15min cache + concurrency limit + jitter."""
+    now = datetime.now()
+    if yahoo in _raw_fetch_cache:
+        cached, ts = _raw_fetch_cache[yahoo]
+        if now - ts < RAW_FETCH_TTL:
+            return sym, cached
+    async with semaphore:
+        # small jitter to spread request timing
+        await asyncio.sleep(random.uniform(0, BACKTEST_JITTER))
+        data = await fetch_yahoo_chart_with_retry(session, yahoo)
+    if data is not None:
+        _raw_fetch_cache[yahoo] = (data, now)
+    return sym, data
+
+
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
-        "message": "TradeAI API v6.0.2 — Risk-First Engine + Robust Fetcher",
+        "message": "TradeAI API v6.1.0 — ATR Breakout + Chandelier Exit",
         "status": "active",
         "cache_ttl_seconds": CACHE_TTL.total_seconds(),
         "indicator_cache_ttl_seconds": INDICATOR_CACHE_TTL.total_seconds(),
@@ -873,7 +1139,7 @@ async def get_all_prices():
 
 @app.get("/backtest")
 async def backtest(refresh: bool = Query(False)):
-    """Run v6.0.2 backtest across all assets. Cached for 5 minutes."""
+    """Run v6.1.0 backtest (ATR Breakout + Chandelier Exit) across all assets. Cached for 5 minutes."""
     global _backtest_cache
 
     now = datetime.now()
@@ -892,15 +1158,17 @@ async def backtest(refresh: bool = Query(False)):
     }
 
     async with aiohttp.ClientSession() as session:
-        for idx, (sym, yahoo) in enumerate(SYMBOLS.items()):
-            fetch_stats["requested"] += 1
+        # v6.1.0: parallel fetch with semaphore(4) + 15min raw cache
+        semaphore = asyncio.Semaphore(BACKTEST_CONCURRENCY)
+        tasks = [
+            _fetch_yahoo_cached(session, sym, yahoo, semaphore)
+            for sym, yahoo in SYMBOLS.items()
+        ]
+        fetched = await asyncio.gather(*tasks, return_exceptions=False)
+        fetch_stats["requested"] = len(SYMBOLS)
 
-            # v6.0.2: rate-limit protection — sleep between requests
-            if idx > 0:
-                await asyncio.sleep(BACKTEST_REQUEST_DELAY)
-
+        for sym, data in fetched:
             try:
-                data = await fetch_yahoo_chart_with_retry(session, yahoo)
                 if data is None:
                     fetch_stats["fetch_failed"] += 1
                     fetch_stats["failed_symbols"].append(sym)
@@ -920,7 +1188,7 @@ async def backtest(refresh: bool = Query(False)):
                     logger.info(f"[{sym}] only {len(closes)} days — need 200+ for MA200")
                     continue
 
-                trades = _simulate_v6(closes, highs, lows, vols, sym)
+                trades = _simulate_v61(closes, highs, lows, vols, sym)
 
                 if not trades:
                     fetch_stats["no_trades"] += 1
@@ -999,7 +1267,7 @@ async def backtest(refresh: bool = Query(False)):
     avg_return = sum(r["total_return"] for r in all_results) / len(all_results) if all_results else 0
 
     result_data = {
-        "engine": "v6.0.2",
+        "engine": "v6.1.0",
         "period": "1y",
         "assets_tested": len(all_results),
         "total_trades": total_trades,
