@@ -158,13 +158,17 @@ async def fetch_coingecko_quotes(session):
 # ============================================================
 # Indicators
 # ============================================================
-def synth_history(price, change_pct, n=60):
+def synth_history(price: float, change_pct: float, n: int = 60) -> list:
+    """Build a synthetic OHLC series for indicator calc when no real history."""
     if not price or price <= 0:
         return []
-    closes = [price * (1 - (change_pct / 100.0) * (1 - i / n)) for i in range(n)]
-    highs = [c * (1 + 0.005 + (i % 3) * 0.002) for c in closes]
-    lows = [c * (1 - 0.005 - (i % 4) * 0.002) for c in closes]
-    return [{"c": c, "h": h, "l": l} for c, h, l in zip(closes, highs, lows)]
+    out = []
+    for i in range(n):
+        c = price * (1 - (change_pct / 100.0) * (1 - i / n))
+        h = c * (1 + 0.005 + (i % 3) * 0.002)
+        l = c * (1 - 0.005 - (i % 4) * 0.002)
+        out.append({"c": c, "h": h, "l": l})
+    return out
 
 def rsi(series, period=14):
     if len(series) < period + 1:
