@@ -1,7 +1,1 @@
-services:
-  - type: web
-    name: tradeai-api
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+web: uvicorn main:app --host 0.0.0.0 --port $PORT
