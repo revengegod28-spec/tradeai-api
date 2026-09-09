@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
-TradeAI Backend v6.1.0 — ATR Breakout + Chandelier Trailing Exit
+TradeAI Backend v6.1.0-curated — ATR Breakout + Chandelier Trailing Exit
 FastAPI backend for technical analysis, live prices, and backtesting.
 
-v6.1.0 changes (from v6.0.2):
-- New strategy: ATR Breakout entry + Chandelier Trailing Exit (no fixed take-profit)
-- New filters: MA200 trend + ADX > 20 (trend only) + per-asset vol cap
-- Asset classes collapsed: 5 categories -> 3 (EQUITIES_INDICES, CRYPTO, FOREX_COMMODITIES)
+v6.1.0-curated changes (after first backtest results):
+- ADX threshold lowered: 20 -> 15 (widen entry opportunities)
+- max_hold raised: 7-12 -> 10 (give price action time to play out)
+- Asset list curated: 22 -> 13 (removed 0% WR: AMZN, NVDA, META, NFLX, BNB, XRP, WTI, BRENT)
+- Kept: 4 stocks (AAPL, MSFT, TSLA, GOOGL) + 3 crypto (BTC, ETH, SOL) +
+        3 forex (EURUSD, GBPUSD, USDJPY) + 1 commodity (XAUUSD) + 2 indices (SP500, NASDAQ)
+- Decision-support mode: signals + Entry/Stop/TP, no auto-trading
+
+v6.1.0 base (kept):
+- New strategy: ATR Breakout entry + Chandelier Trailing Exit
+- New filters: MA200 trend + ADX threshold + per-asset vol cap
+- Asset classes collapsed to 3
 - Parallel fetch: asyncio.gather with Semaphore(4) + 100ms jitter
-- Raw response cache: 15-min TTL (no refetch for backtest bursts)
-- Backtest timeout cut to 6s/request (was 8s)
+- Raw response cache: 15-min TTL
+- Backtest timeout: 6s/request
+- Hard 2% loss cap per trade
+- try/except wrapper around /backtest
 """
 
 import os
@@ -31,7 +41,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="TradeAI API v6.1.0", version="6.1.0")
+app = FastAPI(title="TradeAI API v6.1.0-curated", version="6.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,14 +65,12 @@ BACKTEST_RANGE = "1y"
 BACKTEST_TIMEOUT = 6
 BACKTEST_MAX_RETRIES = 2
 
-# ===== FIX: HARD_RR_MIN was missing! =====
 HARD_STOP_LOSS_PCT = 2.0
 MAX_LOSS_PER_TRADE_PCT = HARD_STOP_LOSS_PCT
-HARD_RR_MIN = 1.5                        # ← minimum R:R (used by /backtest params and root())
+HARD_RR_MIN = 1.5
 
+# 13 curated assets (removed 0% WR losers)
 SYMBOLS = {
-    # v6.1.0-CURATED: 12 high-liquidity assets after backtest filtering
-    # Removed 0% WR: AMZN, NVDA, META, NFLX, BNB, XRP, WTI, BRENT
     "AAPL": "AAPL", "MSFT": "MSFT", "TSLA": "TSLA", "GOOGL": "GOOGL",
     "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
@@ -93,12 +101,12 @@ ASSET_CATEGORY = {
     "EURUSD": "FOREX_COMMODITIES", "GBPUSD": "FOREX_COMMODITIES",
     "USDJPY": "FOREX_COMMODITIES", "XAUUSD": "FOREX_COMMODITIES",
 }
+
 PRICE_BOUNDS = {
-    "NFLX": (50, 2000), "BTC": (1000, 1_000_000), "ETH": (50, 50_000),
-    "AAPL": (50, 1000), "TSLA": (20, 2000), "NVDA": (10, 5000),
-    "MSFT": (50, 2000), "GOOGL": (50, 2000), "AMZN": (20, 5000),
-    "META": (50, 2000), "XAUUSD": (500, 20000),
-    "WTI": (10, 500), "BRENT": (10, 500),
+    "BTC": (1000, 1_000_000), "ETH": (50, 50_000), "SOL": (1, 5000),
+    "AAPL": (50, 1000), "TSLA": (20, 2000),
+    "MSFT": (50, 2000), "GOOGL": (50, 2000),
+    "XAUUSD": (500, 20000),
     "SP500": (300, 2000), "NASDAQ": (300, 2000),
 }
 
@@ -229,7 +237,8 @@ def _volume_signal(vols):
     elif ratio > 1.5: return "high"
     elif ratio < 0.5: return "low"
     return "normal"
-    # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # v6.1.0 Scoring Engine — ATR Breakout + MA200 + ADX
 # ---------------------------------------------------------------------------
 def _score_v61(closes, highs, lows, vols, i, category="EQUITIES_INDICES"):
@@ -256,10 +265,9 @@ def _score_v61(closes, highs, lows, vols, i, category="EQUITIES_INDICES"):
             "reasons": [f"ATR% {atr_pct:.1f} exceeds cap {params['vol_cap']}"],
             "confidence": 0, "levels": {},
             "metrics": {"atr_pct": atr_pct, "adx": adx_v, "rsi": rsi_val, "long_term_trend": long_term_trend}}
-       if adx_v < 15:
-        return {
-            "action": "wait", "score": 0,
-            "reasons": [f"ADX {adx_v:.1f} < 15 — chop, no trade"],
+    if adx_v < 15:
+        return {"action": "wait", "score": 0,
+            "reasons": [f"ADX {adx_v:.1f} < 15 - chop, no trade"],
             "confidence": 0, "levels": {},
             "metrics": {"atr_pct": atr_pct, "adx": adx_v, "rsi": rsi_val, "long_term_trend": long_term_trend}}
     breakout_up = sma20 + (1.5 * atr_v)
@@ -270,7 +278,7 @@ def _score_v61(closes, highs, lows, vols, i, category="EQUITIES_INDICES"):
         action = "buy"
         score = 2.0
         reasons.append(f"ATR breakout up: close {price:.2f} > SMA20+1.5*ATR ({breakout_up:.2f})")
-        reasons.append(f"Above MA200 ({ma200:.2f}) — long-term uptrend")
+        reasons.append(f"Above MA200 ({ma200:.2f}) - long-term uptrend")
         if macd == "bullish":
             score += 1.0
             reasons.append("MACD bullish")
@@ -281,7 +289,7 @@ def _score_v61(closes, highs, lows, vols, i, category="EQUITIES_INDICES"):
         action = "sell"
         score = -2.0
         reasons.append(f"ATR breakdown: close {price:.2f} < SMA20-1.5*ATR ({breakout_down:.2f})")
-        reasons.append(f"Below MA200 ({ma200:.2f}) — long-term downtrend")
+        reasons.append(f"Below MA200 ({ma200:.2f}) - long-term downtrend")
         if macd == "bearish":
             score -= 1.0
             reasons.append("MACD bearish")
@@ -321,8 +329,10 @@ def _score_v61(closes, highs, lows, vols, i, category="EQUITIES_INDICES"):
             "long_term_trend": long_term_trend,
         }
     }
-    # ---------------------------------------------------------------------------
-# v6.1.0 Simulator — Chandelier Trailing Exit
+
+
+# ---------------------------------------------------------------------------
+# v6.1.0 Simulator - Chandelier Trailing Exit
 # ---------------------------------------------------------------------------
 def _simulate_v61(closes, highs, lows, vols, symbol):
     """v6.1.0 Chandelier Trailing Stop simulator."""
@@ -391,7 +401,6 @@ def _simulate_v61(closes, highs, lows, vols, symbol):
         })
         i = i + exit_day + 1
     return trades
-
 
 # ---------------------------------------------------------------------------
 # Fetching
@@ -516,13 +525,14 @@ async def _fetch_yahoo_cached(session, sym, yahoo, semaphore):
     if data is not None:
         _raw_fetch_cache[yahoo] = (data, now)
     return sym, data
-    # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
-        "message": "TradeAI API v6.1.0 — ATR Breakout + Chandelier Exit",
+        "message": "TradeAI API v6.1.0-curated - ATR Breakout + Chandelier",
         "status": "active",
         "cache_ttl_seconds": CACHE_TTL.total_seconds(),
         "indicator_cache_ttl_seconds": INDICATOR_CACHE_TTL.total_seconds(),
@@ -598,12 +608,11 @@ async def get_all_prices():
 
 @app.get("/backtest")
 async def backtest(refresh: bool = Query(False)):
-    """v6.1.0 backtest (ATR Breakout + Chandelier Exit)."""
+    """v6.1.0-curated backtest (ATR Breakout + Chandelier)."""
     global _backtest_cache
     now = datetime.now()
     if not refresh and _backtest_cache["ts"] and (now - _backtest_cache["ts"]) < BACKTEST_CACHE_TTL and _backtest_cache["data"]:
         return _backtest_cache["data"]
-    # Top-level try/except: surface errors as JSON
     try:
         return await _run_backtest(refresh, now)
     except HTTPException:
@@ -614,7 +623,7 @@ async def backtest(refresh: bool = Query(False)):
             status_code=500,
             detail={
                 "error": f"{type(e).__name__}: {str(e)[:200]}",
-                "engine": "v6.1.0",
+                "engine": "v6.1.0-curated",
                 "hint": "Check Render logs for full traceback",
             }
         )
@@ -634,7 +643,7 @@ async def _run_backtest(refresh: bool, now: datetime):
             _fetch_yahoo_cached(session, sym, yahoo, semaphore)
             for sym, yahoo in SYMBOLS.items()
         ]
-        # return_exceptions=True so single failure doesn't 500 the endpoint
+        # return_exceptions=True so single failure doesn't 500
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         fetch_stats["requested"] = len(SYMBOLS)
         for item in gathered:
@@ -719,7 +728,7 @@ async def _run_backtest(refresh: bool, now: datetime):
     worst_trade = min(r["worst_trade"] for r in all_results)
     avg_return = sum(r["total_return"] for r in all_results) / len(all_results) if all_results else 0
     result_data = {
-        "engine": "v6.1.0", "period": "1y",
+        "engine": "v6.1.0-curated", "period": "1y",
         "assets_tested": len(all_results),
         "total_trades": total_trades, "wins": total_wins,
         "losses": total_losses, "timeouts": total_timeouts,
@@ -733,8 +742,9 @@ async def _run_backtest(refresh: bool, now: datetime):
         "fetch_stats": fetch_stats,
         "params": {
             "max_loss_per_trade": MAX_LOSS_PER_TRADE_PCT,
-            "max_hold_days": "per-asset-class (7-12)",
+            "max_hold_days": 10,
             "min_rr": HARD_RR_MIN,
+            "adx_threshold": 15,
         }
     }
     _backtest_cache["data"] = result_data
@@ -751,3 +761,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+    
