@@ -61,12 +61,12 @@ MAX_LOSS_PER_TRADE_PCT = HARD_STOP_LOSS_PCT
 HARD_RR_MIN = 1.5                        # ← minimum R:R (used by /backtest params and root())
 
 SYMBOLS = {
-    "AAPL": "AAPL", "TSLA": "TSLA", "MSFT": "MSFT", "GOOGL": "GOOGL",
-    "AMZN": "AMZN", "NVDA": "NVDA", "META": "META", "NFLX": "NFLX",
-    "BTC": "BTC-USD", "ETH": "ETH-USD", "BNB": "BNB-USD",
-    "SOL": "SOL-USD", "XRP": "XRP-USD",
+    # v6.1.0-CURATED: 12 high-liquidity assets after backtest filtering
+    # Removed 0% WR: AMZN, NVDA, META, NFLX, BNB, XRP, WTI, BRENT
+    "AAPL": "AAPL", "MSFT": "MSFT", "TSLA": "TSLA", "GOOGL": "GOOGL",
+    "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
-    "XAUUSD": "GC=F", "WTI": "CL=F", "BRENT": "BZ=F",
+    "XAUUSD": "GC=F",
     "SP500": "^GSPC", "NASDAQ": "^IXIC",
 }
 
@@ -76,27 +76,23 @@ ASSET_PARAMS = {
         "rsi_low": 30, "rsi_high": 70, "size_mult": 1.0,
     },
     "CRYPTO": {
-        "atr_mult": 2.0, "max_hold": 7, "vol_cap": 6.0, "chandelier_mult": 3.0,
+        "atr_mult": 2.0, "max_hold": 10, "vol_cap": 6.0, "chandelier_mult": 3.0,
         "rsi_low": 25, "rsi_high": 75, "size_mult": 0.5,
     },
     "FOREX_COMMODITIES": {
-        "atr_mult": 1.2, "max_hold": 12, "vol_cap": 2.0, "chandelier_mult": 2.0,
+        "atr_mult": 1.2, "max_hold": 10, "vol_cap": 2.0, "chandelier_mult": 2.0,
         "rsi_low": 35, "rsi_high": 65, "size_mult": 1.0,
     },
 }
 
 ASSET_CATEGORY = {
-    "AAPL": "EQUITIES_INDICES", "TSLA": "EQUITIES_INDICES",
-    "MSFT": "EQUITIES_INDICES", "GOOGL": "EQUITIES_INDICES",
-    "AMZN": "EQUITIES_INDICES", "NVDA": "EQUITIES_INDICES",
-    "META": "EQUITIES_INDICES", "NFLX": "EQUITIES_INDICES",
+    "AAPL": "EQUITIES_INDICES", "MSFT": "EQUITIES_INDICES",
+    "TSLA": "EQUITIES_INDICES", "GOOGL": "EQUITIES_INDICES",
     "SP500": "EQUITIES_INDICES", "NASDAQ": "EQUITIES_INDICES",
-    "BTC": "CRYPTO", "ETH": "CRYPTO", "BNB": "CRYPTO", "SOL": "CRYPTO", "XRP": "CRYPTO",
+    "BTC": "CRYPTO", "ETH": "CRYPTO", "SOL": "CRYPTO",
     "EURUSD": "FOREX_COMMODITIES", "GBPUSD": "FOREX_COMMODITIES",
     "USDJPY": "FOREX_COMMODITIES", "XAUUSD": "FOREX_COMMODITIES",
-    "WTI": "FOREX_COMMODITIES", "BRENT": "FOREX_COMMODITIES",
 }
-
 PRICE_BOUNDS = {
     "NFLX": (50, 2000), "BTC": (1000, 1_000_000), "ETH": (50, 50_000),
     "AAPL": (50, 1000), "TSLA": (20, 2000), "NVDA": (10, 5000),
@@ -260,9 +256,10 @@ def _score_v61(closes, highs, lows, vols, i, category="EQUITIES_INDICES"):
             "reasons": [f"ATR% {atr_pct:.1f} exceeds cap {params['vol_cap']}"],
             "confidence": 0, "levels": {},
             "metrics": {"atr_pct": atr_pct, "adx": adx_v, "rsi": rsi_val, "long_term_trend": long_term_trend}}
-    if adx_v < 20:
-        return {"action": "wait", "score": 0,
-            "reasons": [f"ADX {adx_v:.1f} < 20 — chop, no trade"],
+       if adx_v < 15:
+        return {
+            "action": "wait", "score": 0,
+            "reasons": [f"ADX {adx_v:.1f} < 15 — chop, no trade"],
             "confidence": 0, "levels": {},
             "metrics": {"atr_pct": atr_pct, "adx": adx_v, "rsi": rsi_val, "long_term_trend": long_term_trend}}
     breakout_up = sma20 + (1.5 * atr_v)
