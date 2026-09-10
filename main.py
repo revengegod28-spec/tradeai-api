@@ -75,6 +75,7 @@ BACKTEST_MAX_RETRIES = 2                # retries on 429/5xx
 # ---------------------------------------------------------------------------
 HARD_STOP_LOSS_PCT = 2.0                # Never lose more than 2% on a single trade
 MAX_LOSS_PER_TRADE_PCT = HARD_STOP_LOSS_PCT  # alias kept for back-compat
+HARD_RR_MIN = 1.5                        # Minimum R:R ratio (referenced by / and /backtest params)
 
 # ---------------------------------------------------------------------------
 # Asset Definitions
