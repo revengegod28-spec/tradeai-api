@@ -1,14 +1,16 @@
 """
-TradeAI Backend API - v6.2.1
+TradeAI Backend API - v6.2.2
 ============================
-Stage 1 Rule Improvements + Backtest Fixes:
-  - Anti-Chase Filter: penalize buy signals after big intraday moves
-  - MA200 Veto: reject buys in confirmed downtrends
-  - Triple Confirmation: require >=1 independent signal aligned
-  - Threshold lowered to +/-2 (filters are stronger now)
-  - Backtest: real change% from history (was hardcoded to 0)
+Stage 1+ Improvements (Strict Selectivity):
+  - Threshold raised to +/-4 (require very strong consensus)
+  - Triple Confirmation: require >=2 independent signals aligned
+  - 30-day cooldown between trades on same asset
+  - Golden Cross filter: MA50 > MA200 required for buys
+  - Death Cross filter: MA50 < MA200 required for sells
+  - Anti-chase tightened to >2% (was >1%)
+  - Max 5 trades per asset per year (forces selectivity)
 Endpoints:
-  GET /                -> health check + asset count
+  GET /                -> health check
   GET /prices          -> all 21 assets (live indicators)
   GET /price/{symbol}  -> single asset detail
   GET /backtest        -> simulate rules on 12 months of synthetic history
@@ -16,13 +18,12 @@ Endpoints:
 import os
 import time
 import asyncio
-import statistics
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import aiohttp
 
-app = FastAPI(title="TradeAI API", version="6.2.1")
+app = FastAPI(title="TradeAI API", version="6.2.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -140,7 +141,6 @@ def calc_pivot(high: float, low: float, close: float) -> dict:
     }
 
 def synth_history(current_price: float, change_pct: float, n: int = 250) -> List[dict]:
-    """Build a synthetic 250-day history anchored to current_price and change_pct."""
     out = []
     price = current_price / (1 + change_pct / 100) if change_pct != 0 else current_price * 0.98
     daily_vol = 0.015
@@ -161,50 +161,56 @@ def synth_history(current_price: float, change_pct: float, n: int = 250) -> List
     return out
 
 def anti_chase_filter(action: str, change_pct: float, score_delta: int) -> tuple:
-    """Penalize buy signals after big intraday moves."""
+    """v6.2.2: tightened to >2% (was >1%)."""
+    if action == "buy" and change_pct > 2.0:
+        return (score_delta - 3, "buy signal after >2% rise - late entry")
     if action == "buy" and change_pct > 1.5:
-        return (score_delta - 2, "buy signal after >1.5% rise - late entry")
-    if action == "buy" and change_pct > 1.0:
-        return (score_delta - 1, "buy signal after >1% rise - partial reduction")
-    if action == "sell" and change_pct < -1.5:
+        return (score_delta - 2, "buy signal after >1.5% rise - reduced")
+    if action == "sell" and change_pct < -2.0:
         return (score_delta + 1, "sell signal after strong drop - boosted")
     return (score_delta, None)
 
-def ma200_veto(action: str, price: float, ma200: float, ma50: float) -> str:
-    """Reject buys in confirmed downtrends."""
-    if action == "buy" and ma200 is not None and ma50 is not None and price < ma200 and ma50 < ma200:
+def trend_cross_filter(action: str, price: float, ma50: Optional[float], ma200: Optional[float]) -> str:
+    """v6.2.2: Golden Cross for buys, Death Cross for sells."""
+    if ma50 is None or ma200 is None:
+        return action
+    if action == "buy" and ma50 < ma200:
         return "wait"
-    if action == "sell" and ma200 is not None and ma50 is not None and price > ma200 and ma50 > ma200:
+    if action == "sell" and ma50 > ma200:
         return "wait"
     return action
 
 def triple_confirmation(rsi: Optional[float], macd_signal: Optional[str],
-                        price: float, ma200: Optional[float],
+                        price: float, ma50: Optional[float], ma200: Optional[float],
                         bb: Optional[dict], action: str) -> int:
-    """Count independent signals confirming the action."""
+    """v6.2.2: stricter - need >=2 confirms."""
     confirms = 0
     if action == "buy":
-        if rsi is not None and rsi < 65 and rsi > 30:
+        if rsi is not None and rsi < 60 and rsi > 30:
             confirms += 1
         if macd_signal == "bullish":
             confirms += 1
-        if ma200 is not None and price > ma200:
+        if ma50 is not None and ma200 is not None and ma50 > ma200 and price > ma50:
             confirms += 1
-        if bb is not None and price < bb["upper"] * 0.98:
+        if bb is not None and price < bb["upper"] * 0.95:
+            confirms += 1
+        if rsi is not None and rsi <= 35:
             confirms += 1
     elif action == "sell":
-        if rsi is not None and rsi > 35 and rsi < 70:
+        if rsi is not None and rsi > 40 and rsi < 70:
             confirms += 1
         if macd_signal == "bearish":
             confirms += 1
-        if ma200 is not None and price < ma200:
+        if ma50 is not None and ma200 is not None and ma50 < ma200 and price < ma50:
             confirms += 1
-        if bb is not None and price > bb["lower"] * 1.02:
+        if bb is not None and price > bb["lower"] * 1.05:
+            confirms += 1
+        if rsi is not None and rsi >= 65:
             confirms += 1
     return confirms
 
 def compute_v5_recommendation(asset_data: dict, indicators: dict) -> dict:
-    """v6.2.1: Returns action, confidence, score, reasons, levels."""
+    """v6.2.2: stricter thresholds + cross filter."""
     price = asset_data.get("price", 0)
     change = asset_data.get("change", 0)
     rsi = indicators.get("rsi")
@@ -217,26 +223,25 @@ def compute_v5_recommendation(asset_data: dict, indicators: dict) -> dict:
     score = 0
     reasons = []
 
-    if change >= 1.5:
+    if change >= 2.0:
         score += 2
-        reasons.append("strong bullish momentum")
-    elif change >= 0.5:
+        reasons.append("strong bullish momentum (>2%)")
+    elif change >= 1.0:
         score += 1
         reasons.append("bullish momentum")
-    elif change <= -1.5:
+    elif change <= -2.0:
         score -= 2
-        reasons.append("strong bearish momentum")
-    elif change <= -0.5:
+        reasons.append("strong bearish momentum (<-2%)")
+    elif change <= -1.0:
         score -= 1
         reasons.append("bearish momentum")
 
-    if ma50 is not None:
-        if price > ma50 and change > 0:
-            score += 1
-            reasons.append("above MA50")
-        elif price < ma50 and change < 0:
-            score -= 1
-            reasons.append("below MA50")
+    if ma50 is not None and change > 0 and price > ma50:
+        score += 1
+        reasons.append("above MA50 with positive change")
+    elif ma50 is not None and change < 0 and price < ma50:
+        score -= 1
+        reasons.append("below MA50 with negative change")
 
     if macd_sig == "bullish":
         score += 1
@@ -247,11 +252,17 @@ def compute_v5_recommendation(asset_data: dict, indicators: dict) -> dict:
 
     if rsi is not None:
         if rsi >= 75:
-            score -= 1
+            score -= 2
             reasons.append("RSI overbought")
         elif rsi <= 25:
-            score += 1
+            score += 2
             reasons.append("RSI oversold")
+        elif rsi >= 65:
+            score -= 1
+            reasons.append("RSI high")
+        elif rsi <= 35:
+            score += 1
+            reasons.append("RSI low")
 
     if bb is not None:
         if price > bb["upper"]:
@@ -261,34 +272,35 @@ def compute_v5_recommendation(asset_data: dict, indicators: dict) -> dict:
             score += 1
             reasons.append("below BB lower")
 
-    if ma200 is not None:
-        if price > ma200 and change > 0:
+    if ma200 is not None and ma50 is not None:
+        if ma50 > ma200 and change > 0:
             score += 1
-            reasons.append("above MA200")
-        elif price < ma200 and change < 0:
+            reasons.append("golden cross + positive change")
+        elif ma50 < ma200 and change < 0:
             score -= 1
-            reasons.append("below MA200")
+            reasons.append("death cross + negative change")
 
     score, anti_reason = anti_chase_filter("buy" if score > 0 else "sell", change, score)
     if anti_reason:
         reasons.append(anti_reason)
 
-    action = "buy" if score >= 2 else "sell" if score <= -2 else "wait"
+    action = "buy" if score >= 4 else "sell" if score <= -4 else "wait"
     original_action = action
-    action = ma200_veto(action, price, ma200, ma50)
-    if action == "wait" and original_action != "wait":
-        reasons.append("MA200 veto: rejected for major opposing trend")
 
-    confirms = triple_confirmation(rsi, macd_sig, price, ma200, bb, action)
-    if action != "wait" and confirms < 1:
+    action = trend_cross_filter(action, price, ma50, ma200)
+    if action == "wait" and original_action != "wait":
+        reasons.append("trend cross filter: rejected (golden/death cross conflict)")
+
+    confirms = triple_confirmation(rsi, macd_sig, price, ma50, ma200, bb, action)
+    if action != "wait" and confirms < 2:
         action = "wait"
-        reasons.append(f"weak confirmation: {confirms}/4 - switched to wait")
+        reasons.append(f"insufficient confirmation: {confirms}/5")
 
     abs_score = abs(score)
     if action == "wait":
         confidence = 50
     else:
-        confidence = min(85, 55 + abs_score * 5)
+        confidence = min(85, 55 + abs_score * 4)
 
     levels = None
     if action != "wait" and atr is not None and atr > 0:
@@ -318,10 +330,8 @@ def build_indicators(history: List[dict], current_price: float, change_pct: floa
     closes = [c["c"] for c in history]
     highs = [c["h"] for c in history]
     lows = [c["l"] for c in history]
-
     if len(closes) < 2:
         return {}
-
     rsi = calc_rsi(closes)
     macd = calc_macd(closes)
     ma50 = calc_ma(closes, 50)
@@ -330,7 +340,6 @@ def build_indicators(history: List[dict], current_price: float, change_pct: floa
     stoch = calc_stoch(highs, lows, closes)
     atr = calc_atr(highs, lows, closes)
     pivot = calc_pivot(highs[-1], lows[-1], closes[-1])
-
     return {
         "rsi": round(rsi, 2) if rsi else None,
         "macd_signal": macd["signal"] if macd else None,
@@ -395,40 +404,34 @@ async def fetch_coingecko(session: aiohttp.ClientSession, cg_id: str) -> Optiona
 async def fetch_one_asset(asset: dict, session: aiohttp.ClientSession) -> dict:
     cache_key = asset["id"]
     now = time.time()
-
     if cache_key in indicator_cache and (now - indicator_cache[cache_key]["ts"]) < INDICATOR_TTL:
         cached_ind = indicator_cache[cache_key]["data"]
         cached_price = price_cache.get(cache_key, {})
         if cached_price:
             return {**asset, **cached_price, "indicators": cached_ind}
-
     price_data = None
     if asset.get("coingecko"):
         price_data = await fetch_coingecko(session, asset["coingecko"])
     if price_data is None and asset.get("yahoo"):
         price_data = await fetch_yahoo(session, asset["yahoo"])
-
     if price_data is None:
         if cache_key in price_cache:
             price_data = price_cache[cache_key]
         else:
             return {"id": asset["id"], "symbol": asset["symbol"], "error": "no data"}
-
     price_cache[cache_key] = price_data
-
     history = synth_history(price_data["price"], price_data["change"])
     indicators = build_indicators(history, price_data["price"], price_data["change"])
-
     indicator_cache[cache_key] = {"data": indicators, "ts": now}
-
     return {**asset, **price_data, "indicators": indicators}
 
 @app.get("/")
 async def root():
     return {
         "service": "TradeAI API",
-        "version": "6.2.1",
-        "stage": "1 improvements + backtest fixes",
+        "version": "6.2.2",
+        "stage": "1+ improvements (strict selectivity)",
+        "filters": ["Anti-Chase >2%", "Trend Cross", "Triple Confirmation >=2", "Threshold +/-4", "30-day cooldown", "Max 5 trades/year/asset"],
         "assets": len(ASSETS),
         "endpoints": ["/", "/prices", "/price/{symbol}", "/backtest"],
         "status": "ok",
@@ -450,11 +453,9 @@ async def prices(refresh: int = Query(0, ge=0, le=1)):
                                 "v5_score": rec["score"], "v5_reasons": rec["reasons"],
                                 "v5_confidence": rec["confidence"], "v5_levels": rec["levels"]})
             return {"assets": out, "cached": True, "ts": now}
-
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_one_asset(a, session) for a in ASSETS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
     out = []
     for r in results:
         if isinstance(r, Exception):
@@ -470,7 +471,6 @@ async def prices(refresh: int = Query(0, ge=0, le=1)):
         out.append({**r, "v5_action": rec["action"], "v5_score": rec["score"],
                     "v5_reasons": rec["reasons"], "v5_confidence": rec["confidence"],
                     "v5_levels": rec["levels"]})
-
     return {"assets": out, "cached": False, "ts": now}
 
 @app.get("/price/{symbol}")
@@ -499,7 +499,6 @@ def simulate_trade(history: List[dict], entry_idx: int, action: str, atr: float)
     else:
         stop = entry + offset
         target = entry - offset * 2
-
     for j in range(entry_idx + 1, min(entry_idx + MAX_HOLD + 1, len(history))):
         h = history[j]["h"]
         l = history[j]["l"]
@@ -518,14 +517,13 @@ def simulate_trade(history: List[dict], entry_idx: int, action: str, atr: float)
             if l <= target:
                 pnl = ((entry - target) / entry) * 100
                 return {"exit": "target", "pnl_pct": round(pnl, 2), "days": j - entry_idx}
-
     last = history[min(entry_idx + MAX_HOLD, len(history) - 1)]["c"]
     pnl = ((last - entry) / entry) * 100 * (1 if action == "buy" else -1)
     return {"exit": "timeout", "pnl_pct": round(pnl, 2), "days": MAX_HOLD}
 
 @app.get("/backtest")
 async def backtest(refresh: int = Query(0, ge=0, le=1)):
-    """Simulate v6.2.1 rules on 12 months of synthetic history per asset."""
+    """v6.2.2: Strict selectivity - max 5 trades per asset per year, 30-day cooldown."""
     global backtest_cache
     now = time.time()
     if not refresh and backtest_cache and (now - backtest_cache.get("ts", 0)) < 300:
@@ -540,6 +538,9 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
     }
 
     trades = []
+    MAX_TRADES_PER_ASSET = 5
+    COOLDOWN_DAYS = 30
+
     for asset in ASSETS:
         cache_key = asset["id"]
         if cache_key in price_cache:
@@ -548,14 +549,17 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
         else:
             base = base_prices.get(asset["id"], 100)
             price_data = {"price": base, "change": 0.5}
-            history = synth_history(base, 0.5)
-            ind = build_indicators(history, base, 0.5)
+            history_init = synth_history(base, 0.5)
+            ind = build_indicators(history_init, base, 0.5)
 
         history = synth_history(price_data["price"], price_data.get("change", 0), n=250)
         atr = ind.get("atr") or (history[-1]["c"] * 0.02)
         last_entry_idx = -999
+        asset_trade_count = 0
 
         for i in range(60, len(history) - 30):
+            if asset_trade_count >= MAX_TRADES_PER_ASSET:
+                break
             sub_hist = history[:i + 1]
             sub_ind = build_indicators(sub_hist, history[i]["c"], 0)
             if i > 0 and history[i - 1]["c"] > 0:
@@ -566,21 +570,22 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
                 {"price": history[i]["c"], "change": real_change},
                 sub_ind
             )
-            if rec["action"] in ["buy", "sell"] and (i - last_entry_idx) >= 10:
+            if rec["action"] in ["buy", "sell"] and (i - last_entry_idx) >= COOLDOWN_DAYS:
                 trade = simulate_trade(history, i, rec["action"], atr)
                 trade["symbol"] = asset["id"]
                 trade["action"] = rec["action"]
                 trade["confidence"] = rec["confidence"]
                 trades.append(trade)
                 last_entry_idx = i
+                asset_trade_count += 1
 
     if not trades:
         return {
             "assets_tested": len(ASSETS), "total_trades": 0, "win_rate": 0,
             "avg_pnl": 0, "wins": 0, "losses": 0, "timeouts": 0,
             "best_trade": 0, "worst_trade": 0, "max_drawdown_pct": 0,
-            "trades": [], "version": "6.2.1",
-            "rules": "Stage 1 + backtest fix: real change + relaxed filters"
+            "trades": [], "version": "6.2.2",
+            "rules": "v6.2.2 strict: threshold +/-4, triple >=2, cooldown 30d, max 5/asset"
         }
 
     wins = [t for t in trades if t["exit"] == "target"]
@@ -612,15 +617,15 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
         "worst_trade": round(worst, 2),
         "max_drawdown_pct": round(max_dd, 2),
         "trades": trades[:50],
-        "version": "6.2.1",
-        "rules": "Stage 1 + backtest fix: real change + relaxed filters",
+        "version": "6.2.2",
+        "rules": "v6.2.2 strict: threshold +/-4, triple >=2, cooldown 30d, max 5/asset",
     }
     backtest_cache = {"data": result, "ts": now}
     return result
 
 @app.on_event("startup")
 async def startup():
-    print(f"TradeAI v6.2.1 starting - {len(ASSETS)} assets, Stage 1 filters active")
+    print(f"TradeAI v6.2.2 starting - {len(ASSETS)} assets, strict selectivity filters active")
 
 if __name__ == "__main__":
     import uvicorn
