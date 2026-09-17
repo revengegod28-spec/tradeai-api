@@ -301,21 +301,21 @@ def compute_v5_recommendation(asset_data: dict, indicators: dict) -> dict:
             score -= 1
             reasons.append("تحت MA200")
     
-    # --- STAGE 1 FILTERS ---
+      # --- STAGE 1 FILTERS ---
     # 1) Anti-chase
     score, anti_reason = anti_chase_filter("buy" if score > 0 else "sell", change, score)
     if anti_reason:
         reasons.append(anti_reason)
     
-    # 2) MA200 veto
-    action = "buy" if score >= 3 else "sell" if score <= -3 else "wait"
+    # 2) MA200 veto (v6.2.1: threshold reduced to ±2 since filters are stronger)
+    action = "buy" if score >= 2 else "sell" if score <= -2 else "wait"
     action = ma200_veto(action, price, ma200, ma50)
-    if action == "wait" and (score >= 3 or score <= -3):
+    if action == "wait" and (score >= 2 or score <= -2):
         reasons.append("MA200 veto: تم الرفض لاتجاه كبير معاكس")
     
-    # 3) Triple confirmation
+       # 3) Triple confirmation (v6.2.1: relaxed to >=1, since MA200 veto is the strict filter)
     confirms = triple_confirmation(rsi, macd_sig, price, ma200, bb, action)
-    if action != "wait" and confirms < 2:
+    if action != "wait" and confirms < 1:
         action = "wait"
         reasons.append(f"تأكيد ضعيف: {confirms}/4 — تم التحويل لانتظار")
     
@@ -612,11 +612,21 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
         
         # Walk forward through history, only act on signals at least 30 days apart
         last_entry_idx = -999
-        for i in range(60, len(history) - 30):
+               for i in range(60, len(history) - 30):
             # Compute indicators at this point (using truncated history)
             sub_hist = history[:i + 1]
             sub_ind = build_indicators(sub_hist, history[i]["c"], 0)
-            rec = compute_v5_recommendation({"price": history[i]["c"], "change": 0}, sub_ind)
+            # v6.2.1: use REAL change from previous day (was hardcoded to 0!)
+            if i > 0 and history[i - 1]["c"] > 0:
+                real_change = ((history[i]["c"] - history[i - 1]["c"]) / history[i - 1]["c"]) * 100
+            else:
+                real_change = 0
+            rec = compute_v5_recommendation(
+                {"price": history[i]["c"], "change": real_change},
+                sub_ind
+            )
+            
+            if rec["action"] in ["buy", "sell"] and (i - last_entry_idx) >= 10:
             
             if rec["action"] in ["buy", "sell"] and (i - last_entry_idx) >= 10:
                 trade = simulate_trade(history, i, rec["action"], atr)
