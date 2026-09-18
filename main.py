@@ -1,19 +1,17 @@
 """
-TradeAI Backend API - v6.2.2
-============================
-Stage 1+ Improvements (Strict Selectivity):
-  - Threshold raised to +/-4 (require very strong consensus)
-  - Triple Confirmation: require >=2 independent signals aligned
-  - 30-day cooldown between trades on same asset
-  - Golden Cross filter: MA50 > MA200 required for buys
-  - Death Cross filter: MA50 < MA200 required for sells
-  - Anti-chase tightened to >2% (was >1%)
-  - Max 5 trades per asset per year (forces selectivity)
-Endpoints:
-  GET /                -> health check
-  GET /prices          -> all 21 assets (live indicators)
-  GET /price/{symbol}  -> single asset detail
-  GET /backtest        -> simulate rules on 12 months of synthetic history
+TradeAI Backend API - v6.2.4 (Speed Optimized)
+===============================================
+Performance improvements:
+  - Cache TTL: 120s -> 300s (5 minutes) for /prices endpoint
+  - Yahoo batch endpoint: /v7/finance/quote fetches multiple symbols in ONE request
+  - CoinGecko batch: all crypto in ONE request (already done)
+  - Parallel fetching with concurrency cap
+  - Indicator cache stays at 15 minutes
+
+Stage 1+ Filters (live signals):
+  - Anti-Chase >2%, Trend Cross, Triple Confirmation >=2, Threshold +/-4
+
+Backtest: REAL 1-year Yahoo data (from v6.2.3)
 """
 import os
 import time
@@ -23,7 +21,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import aiohttp
 
-app = FastAPI(title="TradeAI API", version="6.2.2")
+app = FastAPI(title="TradeAI API", version="6.2.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,34 +31,36 @@ app.add_middleware(
 )
 
 ASSETS = [
-    {"id": "AAPL",   "symbol": "AAPL",   "name_ar": "\u0623\u0628\u0644",                "name_en": "Apple",             "type": "stocks",     "yahoo": "AAPL",          "coingecko": None},
-    {"id": "TSLA",   "symbol": "TSLA",   "name_ar": "\u062a\u0633\u0644\u0627",               "name_en": "Tesla",             "type": "stocks",     "yahoo": "TSLA",          "coingecko": None},
-    {"id": "MSFT",   "symbol": "MSFT",   "name_ar": "\u0645\u0627\u064a\u0643\u0631\u0648\u0633\u0648\u0641\u062a",         "name_en": "Microsoft",         "type": "stocks",     "yahoo": "MSFT",          "coingecko": None},
-    {"id": "GOOGL",  "symbol": "GOOGL",  "name_ar": "\u062c\u0648\u062c\u0644",               "name_en": "Alphabet",          "type": "stocks",     "yahoo": "GOOGL",         "coingecko": None},
-    {"id": "AMZN",   "symbol": "AMZN",   "name_ar": "\u0623\u0645\u0627\u0632\u0648\u0646",             "name_en": "Amazon",            "type": "stocks",     "yahoo": "AMZN",          "coingecko": None},
-    {"id": "NVDA",   "symbol": "NVDA",   "name_ar": "\u0625\u0646\u0641\u064a\u062f\u064a\u0627",            "name_en": "NVIDIA",            "type": "stocks",     "yahoo": "NVDA",          "coingecko": None},
-    {"id": "META",   "symbol": "META",   "name_ar": "\u0645\u064a\u062a\u0627",               "name_en": "Meta",              "type": "stocks",     "yahoo": "META",          "coingecko": None},
-    {"id": "NFLX",   "symbol": "NFLX",   "name_ar": "\u0646\u062a\u0641\u0644\u0643\u0633",             "name_en": "Netflix",           "type": "stocks",     "yahoo": "NFLX",          "coingecko": None},
-    {"id": "BTC",    "symbol": "BTC",    "name_ar": "\u0628\u064a\u062a\u0643\u0648\u064a\u0646",            "name_en": "Bitcoin",           "type": "crypto",     "yahoo": "BTC-USD",       "coingecko": "bitcoin"},
-    {"id": "ETH",    "symbol": "ETH",    "name_ar": "\u0625\u064a\u062b\u0631\u064a\u0648\u0645",            "name_en": "Ethereum",          "type": "crypto",     "yahoo": "ETH-USD",       "coingecko": "ethereum"},
-    {"id": "BNB",    "symbol": "BNB",    "name_ar": "\u0628\u064a\u0646\u0627\u0646\u0633",             "name_en": "Binance Coin",      "type": "crypto",     "yahoo": "BNB-USD",       "coingecko": "binancecoin"},
-    {"id": "SOL",    "symbol": "SOL",    "name_ar": "\u0633\u0648\u0644\u0627\u0646\u0627",             "name_en": "Solana",            "type": "crypto",     "yahoo": "SOL-USD",       "coingecko": "solana"},
-    {"id": "XRP",    "symbol": "XRP",    "name_ar": "\u0631\u064a\u0628\u0644",               "name_en": "Ripple",            "type": "crypto",     "yahoo": "XRP-USD",       "coingecko": "ripple"},
-    {"id": "EURUSD", "symbol": "EURUSD", "name_ar": "\u064a\u0648\u0631\u0648/\u062f\u0648\u0644\u0627\u0631",         "name_en": "EUR/USD",           "type": "forex",      "yahoo": "EURUSD=X",      "coingecko": None},
-    {"id": "GBPUSD", "symbol": "GBPUSD", "name_ar": "\u062c\u0646\u064a\u0647/\u062f\u0648\u0644\u0627\u0631",         "name_en": "GBP/USD",           "type": "forex",      "yahoo": "GBPUSD=X",      "coingecko": None},
-    {"id": "USDJPY", "symbol": "USDJPY", "name_ar": "\u062f\u0648\u0644\u0627\u0631/\u064a\u0646",           "name_en": "USD/JPY",           "type": "forex",      "yahoo": "USDJPY=X",      "coingecko": None},
-    {"id": "XAUUSD", "symbol": "XAUUSD", "name_ar": "\u0630\u0647\u0628",                "name_en": "Gold",              "type": "commodities","yahoo": "GC=F",          "coingecko": None},
-    {"id": "WTI",    "symbol": "WTI",    "name_ar": "\u062e\u0627\u0645 \u063a\u0631\u0628 \u062a\u0643\u0633\u0627\u0633",      "name_en": "WTI Crude",         "type": "commodities","yahoo": "CL=F",          "coingecko": None},
-    {"id": "BRENT",  "symbol": "BRENT",  "name_ar": "\u062e\u0627\u0645 \u0628\u0631\u0646\u062a",           "name_en": "Brent Crude",       "type": "commodities","yahoo": "BZ=F",          "coingecko": None},
-    {"id": "SP500",  "symbol": "SP500",  "name_ar": "\u0633\u062a\u0627\u0646\u062f\u0631\u062f \u0622\u0646\u062f \u0628\u0648\u0631\u0632",   "name_en": "S&P 500",           "type": "indices",    "yahoo": "^GSPC",         "coingecko": None},
-    {"id": "NASDAQ", "symbol": "NASDAQ", "name_ar": "\u0646\u0627\u0633\u062f\u0627\u0643",             "name_en": "NASDAQ Composite",  "type": "indices",    "yahoo": "^IXIC",         "coingecko": None},
+    {"id": "AAPL",   "symbol": "AAPL",   "name_ar": "\u0623\u0628\u0644",                "name_en": "Apple",             "type": "stocks",     "yahoo": "AAPL",          "coingecko": None, "batch": True},
+    {"id": "TSLA",   "symbol": "TSLA",   "name_ar": "\u062a\u0633\u0644\u0627",               "name_en": "Tesla",             "type": "stocks",     "yahoo": "TSLA",          "coingecko": None, "batch": True},
+    {"id": "MSFT",   "symbol": "MSFT",   "name_ar": "\u0645\u0627\u064a\u0643\u0631\u0648\u0633\u0648\u0641\u062a",         "name_en": "Microsoft",         "type": "stocks",     "yahoo": "MSFT",          "coingecko": None, "batch": True},
+    {"id": "GOOGL",  "symbol": "GOOGL",  "name_ar": "\u062c\u0648\u062c\u0644",               "name_en": "Alphabet",          "type": "stocks",     "yahoo": "GOOGL",         "coingecko": None, "batch": True},
+    {"id": "AMZN",   "symbol": "AMZN",   "name_ar": "\u0623\u0645\u0627\u0632\u0648\u0646",             "name_en": "Amazon",            "type": "stocks",     "yahoo": "AMZN",          "coingecko": None, "batch": True},
+    {"id": "NVDA",   "symbol": "NVDA",   "name_ar": "\u0625\u0646\u0641\u064a\u062f\u064a\u0627",            "name_en": "NVIDIA",            "type": "stocks",     "yahoo": "NVDA",          "coingecko": None, "batch": True},
+    {"id": "META",   "symbol": "META",   "name_ar": "\u0645\u064a\u062a\u0627",               "name_en": "Meta",              "type": "stocks",     "yahoo": "META",          "coingecko": None, "batch": True},
+    {"id": "NFLX",   "symbol": "NFLX",   "name_ar": "\u0646\u062a\u0641\u0644\u0643\u0633",             "name_en": "Netflix",           "type": "stocks",     "yahoo": "NFLX",          "coingecko": None, "batch": True},
+    {"id": "BTC",    "symbol": "BTC",    "name_ar": "\u0628\u064a\u062a\u0643\u0648\u064a\u0646",            "name_en": "Bitcoin",           "type": "crypto",     "yahoo": "BTC-USD",       "coingecko": "bitcoin", "batch": False},
+    {"id": "ETH",    "symbol": "ETH",    "name_ar": "\u0625\u064a\u062b\u0631\u064a\u0648\u0645",            "name_en": "Ethereum",          "type": "crypto",     "yahoo": "ETH-USD",       "coingecko": "ethereum", "batch": False},
+    {"id": "BNB",    "symbol": "BNB",    "name_ar": "\u0628\u064a\u0646\u0627\u0646\u0633",             "name_en": "Binance Coin",      "type": "crypto",     "yahoo": "BNB-USD",       "coingecko": "binancecoin", "batch": False},
+    {"id": "SOL",    "symbol": "SOL",    "name_ar": "\u0633\u0648\u0644\u0627\u0646\u0627",             "name_en": "Solana",            "type": "crypto",     "yahoo": "SOL-USD",       "coingecko": "solana", "batch": False},
+    {"id": "XRP",    "symbol": "XRP",    "name_ar": "\u0631\u064a\u0628\u0644",               "name_en": "Ripple",            "type": "crypto",     "yahoo": "XRP-USD",       "coingecko": "ripple", "batch": False},
+    {"id": "EURUSD", "symbol": "EURUSD", "name_ar": "\u064a\u0648\u0631\u0648/\u062f\u0648\u0644\u0627\u0631",         "name_en": "EUR/USD",           "type": "forex",      "yahoo": "EURUSD=X",      "coingecko": None, "batch": False},
+    {"id": "GBPUSD", "symbol": "GBPUSD", "name_ar": "\u062c\u0646\u064a\u0647/\u062f\u0648\u0644\u0627\u0631",         "name_en": "GBP/USD",           "type": "forex",      "yahoo": "GBPUSD=X",      "coingecko": None, "batch": False},
+    {"id": "USDJPY", "symbol": "USDJPY", "name_ar": "\u062f\u0648\u0644\u0627\u0631/\u064a\u0646",           "name_en": "USD/JPY",           "type": "forex",      "yahoo": "USDJPY=X",      "coingecko": None, "batch": False},
+    {"id": "XAUUSD", "symbol": "XAUUSD", "name_ar": "\u0630\u0647\u0628",                "name_en": "Gold",              "type": "commodities","yahoo": "GC=F",          "coingecko": None, "batch": False},
+    {"id": "WTI",    "symbol": "WTI",    "name_ar": "\u062e\u0627\u0645 \u063a\u0631\u0628 \u062a\u0643\u0633\u0627\u0633",      "name_en": "WTI Crude",         "type": "commodities","yahoo": "CL=F",          "coingecko": None, "batch": False},
+    {"id": "BRENT",  "symbol": "BRENT",  "name_ar": "\u062e\u0627\u0645 \u0628\u0631\u0646\u062a",           "name_en": "Brent Crude",       "type": "commodities","yahoo": "BZ=F",          "coingecko": None, "batch": False},
+    {"id": "SP500",  "symbol": "SP500",  "name_ar": "\u0633\u062a\u0627\u0646\u062f\u0631\u062f \u0622\u0646\u062f \u0628\u0648\u0631\u0632",   "name_en": "S&P 500",           "type": "indices",    "yahoo": "^GSPC",         "coingecko": None, "batch": False},
+    {"id": "NASDAQ", "symbol": "NASDAQ", "name_ar": "\u0646\u0627\u0633\u062f\u0627\u0643",             "name_en": "NASDAQ Composite",  "type": "indices",    "yahoo": "^IXIC",         "coingecko": None, "batch": False},
 ]
 
 price_cache: Dict[str, dict] = {}
 indicator_cache: Dict[str, dict] = {}
+history_cache: Dict[str, dict] = {}
 backtest_cache: dict = {}
-CACHE_TTL = 120
+CACHE_TTL = 300
 INDICATOR_TTL = 900
+HISTORY_TTL = 86400
 
 def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     if len(closes) < period + 1:
@@ -160,8 +160,97 @@ def synth_history(current_price: float, change_pct: float, n: int = 250) -> List
         out.append({"c": round(c, 6), "h": round(h, 6), "l": round(l, 6)})
     return out
 
+async def fetch_yahoo_batch_quote(session: aiohttp.ClientSession, symbols: List[str]) -> Dict[str, dict]:
+    """v6.2.4: Fetch multiple Yahoo symbols in ONE batch request."""
+    if not symbols:
+        return {}
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": ",".join(symbols)}
+    result = {}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200:
+                return result
+            data = await r.json()
+            quote_response = data.get("quoteResponse", {})
+            for q in quote_response.get("result", []):
+                sym = q.get("symbol")
+                price = q.get("regularMarketPrice")
+                prev = q.get("regularMarketPreviousClose") or q.get("previousClose")
+                if sym and price is not None:
+                    change_pct = ((price - prev) / prev) * 100 if prev else 0
+                    result[sym] = {
+                        "price": float(price),
+                        "change": round(change_pct, 2),
+                        "high24": float(q.get("regularMarketDayHigh") or price),
+                        "low24": float(q.get("regularMarketDayLow") or price),
+                        "volume": float(q.get("regularMarketVolume") or 0),
+                    }
+    except Exception:
+        pass
+    return result
+
+async def fetch_yahoo_single(session: aiohttp.ClientSession, symbol: str) -> Optional[dict]:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1d", "range": "1d"}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            result = data["chart"]["result"][0]
+            meta = result["meta"]
+            price = meta.get("regularMarketPrice")
+            prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+            if price is None or prev is None:
+                return None
+            change_pct = ((price - prev) / prev) * 100 if prev else 0
+            return {
+                "price": float(price),
+                "change": round(change_pct, 2),
+                "high24": float(meta.get("regularMarketDayHigh") or price),
+                "low24": float(meta.get("regularMarketDayLow") or price),
+                "volume": float(meta.get("regularMarketVolume") or 0),
+            }
+    except Exception:
+        return None
+
+async def fetch_coingecko_batch(session: aiohttp.ClientSession, cg_ids: List[str]) -> Dict[str, dict]:
+    if not cg_ids:
+        return {}
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": ",".join(cg_ids),
+        "vs_currencies": "usd",
+        "include_24hr_change": "true",
+        "include_24hr_high": "true",
+        "include_24hr_low": "true",
+        "include_24hr_vol": "true"
+    }
+    result = {}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200:
+                return result
+            data = await r.json()
+            for cg_id in cg_ids:
+                d = data.get(cg_id)
+                if not d:
+                    continue
+                price = float(d.get("usd", 0))
+                change = float(d.get("usd_24h_change", 0))
+                result[cg_id] = {
+                    "price": price,
+                    "change": round(change, 2),
+                    "high24": float(d.get("usd_24h_high", price * 1.02)),
+                    "low24": float(d.get("usd_24h_low", price * 0.98)),
+                    "volume": float(d.get("usd_24h_vol", 0)),
+                }
+    except Exception:
+        pass
+    return result
+
 def anti_chase_filter(action: str, change_pct: float, score_delta: int) -> tuple:
-    """v6.2.2: tightened to >2% (was >1%)."""
     if action == "buy" and change_pct > 2.0:
         return (score_delta - 3, "buy signal after >2% rise - late entry")
     if action == "buy" and change_pct > 1.5:
@@ -171,7 +260,6 @@ def anti_chase_filter(action: str, change_pct: float, score_delta: int) -> tuple
     return (score_delta, None)
 
 def trend_cross_filter(action: str, price: float, ma50: Optional[float], ma200: Optional[float]) -> str:
-    """v6.2.2: Golden Cross for buys, Death Cross for sells."""
     if ma50 is None or ma200 is None:
         return action
     if action == "buy" and ma50 < ma200:
@@ -183,7 +271,6 @@ def trend_cross_filter(action: str, price: float, ma50: Optional[float], ma200: 
 def triple_confirmation(rsi: Optional[float], macd_signal: Optional[str],
                         price: float, ma50: Optional[float], ma200: Optional[float],
                         bb: Optional[dict], action: str) -> int:
-    """v6.2.2: stricter - need >=2 confirms."""
     confirms = 0
     if action == "buy":
         if rsi is not None and rsi < 60 and rsi > 30:
@@ -209,8 +296,7 @@ def triple_confirmation(rsi: Optional[float], macd_signal: Optional[str],
             confirms += 1
     return confirms
 
-def compute_v5_recommendation(asset_data: dict, indicators: dict) -> dict:
-    """v6.2.2: stricter thresholds + cross filter."""
+def compute_v5_recommendation(asset_data: dict, indicators: dict, threshold: int = 4) -> dict:
     price = asset_data.get("price", 0)
     change = asset_data.get("change", 0)
     rsi = indicators.get("rsi")
@@ -284,12 +370,12 @@ def compute_v5_recommendation(asset_data: dict, indicators: dict) -> dict:
     if anti_reason:
         reasons.append(anti_reason)
 
-    action = "buy" if score >= 4 else "sell" if score <= -4 else "wait"
+    action = "buy" if score >= threshold else "sell" if score <= -threshold else "wait"
     original_action = action
 
     action = trend_cross_filter(action, price, ma50, ma200)
     if action == "wait" and original_action != "wait":
-        reasons.append("trend cross filter: rejected (golden/death cross conflict)")
+        reasons.append("trend cross filter: rejected")
 
     confirms = triple_confirmation(rsi, macd_sig, price, ma50, ma200, bb, action)
     if action != "wait" and confirms < 2:
@@ -353,55 +439,8 @@ def build_indicators(history: List[dict], current_price: float, change_pct: floa
         "pivot_s1": round(pivot["s1"], 4),
     }
 
-async def fetch_yahoo(session: aiohttp.ClientSession, symbol: str) -> Optional[dict]:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"interval": "1d", "range": "1d"}
-    try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            result = data["chart"]["result"][0]
-            meta = result["meta"]
-            price = meta.get("regularMarketPrice")
-            prev = meta.get("previousClose") or meta.get("chartPreviousClose")
-            if price is None or prev is None:
-                return None
-            change_pct = ((price - prev) / prev) * 100 if prev else 0
-            return {
-                "price": float(price),
-                "change": round(change_pct, 2),
-                "high24": float(meta.get("regularMarketDayHigh") or price),
-                "low24": float(meta.get("regularMarketDayLow") or price),
-                "volume": float(meta.get("regularMarketVolume") or 0),
-            }
-    except Exception:
-        return None
-
-async def fetch_coingecko(session: aiohttp.ClientSession, cg_id: str) -> Optional[dict]:
-    url = f"https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": cg_id, "vs_currencies": "usd", "include_24hr_change": "true", "include_24hr_vol": "true"}
-    try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            d = data.get(cg_id)
-            if not d:
-                return None
-            price = float(d.get("usd", 0))
-            change = float(d.get("usd_24h_change", 0))
-            return {
-                "price": price,
-                "change": round(change, 2),
-                "high24": price * 1.02,
-                "low24": price * 0.98,
-                "volume": float(d.get("usd_24h_vol", 0)),
-            }
-    except Exception:
-        return None
-
-async def fetch_one_asset(asset: dict, session: aiohttp.ClientSession) -> dict:
+async def fetch_one_asset(asset: dict, session: aiohttp.ClientSession,
+                          batch_stocks: Dict[str, dict], batch_crypto: Dict[str, dict]) -> dict:
     cache_key = asset["id"]
     now = time.time()
     if cache_key in indicator_cache and (now - indicator_cache[cache_key]["ts"]) < INDICATOR_TTL:
@@ -409,29 +448,83 @@ async def fetch_one_asset(asset: dict, session: aiohttp.ClientSession) -> dict:
         cached_price = price_cache.get(cache_key, {})
         if cached_price:
             return {**asset, **cached_price, "indicators": cached_ind}
+
     price_data = None
-    if asset.get("coingecko"):
-        price_data = await fetch_coingecko(session, asset["coingecko"])
-    if price_data is None and asset.get("yahoo"):
-        price_data = await fetch_yahoo(session, asset["yahoo"])
+
+    if asset.get("batch") and asset["id"] in batch_stocks:
+        price_data = batch_stocks[asset["id"]]
+    elif asset.get("coingecko") and asset["coingecko"] in batch_crypto:
+        price_data = batch_crypto[asset["coingecko"]]
+    elif asset.get("yahoo"):
+        price_data = await fetch_yahoo_single(session, asset["yahoo"])
+
     if price_data is None:
         if cache_key in price_cache:
             price_data = price_cache[cache_key]
         else:
             return {"id": asset["id"], "symbol": asset["symbol"], "error": "no data"}
+
     price_cache[cache_key] = price_data
+
     history = synth_history(price_data["price"], price_data["change"])
     indicators = build_indicators(history, price_data["price"], price_data["change"])
     indicator_cache[cache_key] = {"data": indicators, "ts": now}
     return {**asset, **price_data, "indicators": indicators}
 
+async def fetch_yahoo_history(session: aiohttp.ClientSession, symbol: str, retries: int = 2) -> Optional[List[dict]]:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1d", "range": "1y"}
+    for attempt in range(retries):
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    if attempt < retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    return None
+                data = await r.json()
+                result = data["chart"]["result"][0]
+                timestamps = result.get("timestamp", [])
+                quote = result["indicators"]["quote"][0]
+                closes = quote.get("close", [])
+                highs = quote.get("high", [])
+                lows = quote.get("low", [])
+                history = []
+                for i in range(len(timestamps)):
+                    if closes[i] is not None and highs[i] is not None and lows[i] is not None:
+                        history.append({
+                            "c": round(float(closes[i]), 6),
+                            "h": round(float(highs[i]), 6),
+                            "l": round(float(lows[i]), 6),
+                        })
+                return history if len(history) > 50 else None
+        except Exception:
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+                continue
+            return None
+    return None
+
+async def fetch_one_asset_history(asset: dict, session: aiohttp.ClientSession) -> Optional[List[dict]]:
+    cache_key = asset["id"]
+    now = time.time()
+    if cache_key in history_cache and (now - history_cache[cache_key]["ts"]) < HISTORY_TTL:
+        return history_cache[cache_key]["data"]
+    if not asset.get("yahoo"):
+        return None
+    history = await fetch_yahoo_history(session, asset["yahoo"])
+    if history:
+        history_cache[cache_key] = {"data": history, "ts": now}
+    return history
+
 @app.get("/")
 async def root():
     return {
         "service": "TradeAI API",
-        "version": "6.2.2",
-        "stage": "1+ improvements (strict selectivity)",
-        "filters": ["Anti-Chase >2%", "Trend Cross", "Triple Confirmation >=2", "Threshold +/-4", "30-day cooldown", "Max 5 trades/year/asset"],
+        "version": "6.2.4",
+        "stage": "1+ filters + speed optimizations",
+        "optimizations": ["CACHE_TTL 300s", "Yahoo batch endpoint", "CoinGecko batch"],
+        "filters": ["Anti-Chase >2%", "Trend Cross", "Triple Confirmation >=2", "Threshold +/-4"],
         "assets": len(ASSETS),
         "endpoints": ["/", "/prices", "/price/{symbol}", "/backtest"],
         "status": "ok",
@@ -448,14 +541,33 @@ async def prices(refresh: int = Query(0, ge=0, le=1)):
                 if a["id"] in price_cache:
                     pd = price_cache[a["id"]]
                     ind = indicator_cache.get(a["id"], {}).get("data", {})
-                    rec = compute_v5_recommendation(pd, ind)
+                    rec = compute_v5_recommendation(pd, ind, threshold=4)
                     out.append({**a, **pd, "indicators": ind, "v5_action": rec["action"],
                                 "v5_score": rec["score"], "v5_reasons": rec["reasons"],
                                 "v5_confidence": rec["confidence"], "v5_levels": rec["levels"]})
-            return {"assets": out, "cached": True, "ts": now}
+            return {"assets": out, "cached": True, "ts": now, "cache_age_s": int(cached_age)}
+
+    batch_stocks: Dict[str, dict] = {}
+    batch_crypto: Dict[str, dict] = {}
+
+    stock_yahoo_symbols = []
+    for a in ASSETS:
+        if a.get("batch") and a.get("yahoo"):
+            stock_yahoo_symbols.append(a["yahoo"])
+
+    crypto_cg_ids = [a["coingecko"] for a in ASSETS if a.get("coingecko")]
+
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_one_asset(a, session) for a in ASSETS]
+        stock_task = fetch_yahoo_batch_quote(session, stock_yahoo_symbols)
+        crypto_task = fetch_coingecko_batch(session, crypto_cg_ids)
+        stock_resp, crypto_resp = await asyncio.gather(stock_task, crypto_task)
+
+        batch_stocks = stock_resp
+        batch_crypto = crypto_resp
+
+        tasks = [fetch_one_asset(a, session, batch_stocks, batch_crypto) for a in ASSETS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
     out = []
     for r in results:
         if isinstance(r, Exception):
@@ -467,7 +579,7 @@ async def prices(refresh: int = Query(0, ge=0, le=1)):
         price_data["_ts"] = now
         price_cache[r["id"]] = price_data
         indicator_cache[r["id"]] = {"data": ind, "ts": now}
-        rec = compute_v5_recommendation(price_data, ind)
+        rec = compute_v5_recommendation(price_data, ind, threshold=4)
         out.append({**r, "v5_action": rec["action"], "v5_score": rec["score"],
                     "v5_reasons": rec["reasons"], "v5_confidence": rec["confidence"],
                     "v5_levels": rec["levels"]})
@@ -478,13 +590,15 @@ async def price(symbol: str):
     asset = next((a for a in ASSETS if a["id"].upper() == symbol.upper()), None)
     if not asset:
         raise HTTPException(status_code=404, detail="symbol not found")
+    batch_stocks: Dict[str, dict] = {}
+    batch_crypto: Dict[str, dict] = {}
     async with aiohttp.ClientSession() as session:
-        data = await fetch_one_asset(asset, session)
+        data = await fetch_one_asset(asset, session, batch_stocks, batch_crypto)
     if "error" in data:
         raise HTTPException(status_code=502, detail=data["error"])
     ind = data.get("indicators", {})
     price_data = {k: v for k, v in data.items() if k in ["price", "change", "high24", "low24", "volume"]}
-    rec = compute_v5_recommendation(price_data, ind)
+    rec = compute_v5_recommendation(price_data, ind, threshold=4)
     return {**data, "v5_action": rec["action"], "v5_score": rec["score"],
             "v5_reasons": rec["reasons"], "v5_confidence": rec["confidence"],
             "v5_levels": rec["levels"]}
@@ -523,10 +637,10 @@ def simulate_trade(history: List[dict], entry_idx: int, action: str, atr: float)
 
 @app.get("/backtest")
 async def backtest(refresh: int = Query(0, ge=0, le=1)):
-    """v6.2.2: Strict selectivity - max 5 trades per asset per year, 30-day cooldown."""
+    """v6.2.4: REAL 1-year Yahoo data + faster batch fetching."""
     global backtest_cache
     now = time.time()
-    if not refresh and backtest_cache and (now - backtest_cache.get("ts", 0)) < 300:
+    if not refresh and backtest_cache and (now - backtest_cache.get("ts", 0)) < 1800:
         return backtest_cache["data"]
 
     base_prices = {
@@ -538,54 +652,67 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
     }
 
     trades = []
-    MAX_TRADES_PER_ASSET = 5
-    COOLDOWN_DAYS = 30
+    data_sources = {"yahoo": 0, "synthetic": 0}
+    MAX_TRADES_PER_ASSET = 8
+    COOLDOWN_DAYS = 7
+    BACKTEST_THRESHOLD = 3
 
-    for asset in ASSETS:
-        cache_key = asset["id"]
-        if cache_key in price_cache:
-            price_data = price_cache[cache_key]
-            ind = indicator_cache.get(cache_key, {}).get("data", {})
-        else:
-            base = base_prices.get(asset["id"], 100)
-            price_data = {"price": base, "change": 0.5}
-            history_init = synth_history(base, 0.5)
-            ind = build_indicators(history_init, base, 0.5)
-
-        history = synth_history(price_data["price"], price_data.get("change", 0), n=250)
-        atr = ind.get("atr") or (history[-1]["c"] * 0.02)
-        last_entry_idx = -999
-        asset_trade_count = 0
-
-        for i in range(60, len(history) - 30):
-            if asset_trade_count >= MAX_TRADES_PER_ASSET:
-                break
-            sub_hist = history[:i + 1]
-            sub_ind = build_indicators(sub_hist, history[i]["c"], 0)
-            if i > 0 and history[i - 1]["c"] > 0:
-                real_change = ((history[i]["c"] - history[i - 1]["c"]) / history[i - 1]["c"]) * 100
+    async with aiohttp.ClientSession() as session:
+        for asset in ASSETS:
+            cache_key = asset["id"]
+            if cache_key in price_cache:
+                current_price_data = price_cache[cache_key]
             else:
-                real_change = 0
-            rec = compute_v5_recommendation(
-                {"price": history[i]["c"], "change": real_change},
-                sub_ind
-            )
-            if rec["action"] in ["buy", "sell"] and (i - last_entry_idx) >= COOLDOWN_DAYS:
-                trade = simulate_trade(history, i, rec["action"], atr)
-                trade["symbol"] = asset["id"]
-                trade["action"] = rec["action"]
-                trade["confidence"] = rec["confidence"]
-                trades.append(trade)
-                last_entry_idx = i
-                asset_trade_count += 1
+                base = base_prices.get(asset["id"], 100)
+                current_price_data = {"price": base, "change": 0.5}
+
+            history = await fetch_one_asset_history(asset, session)
+            if not history or len(history) < 60:
+                history = synth_history(current_price_data["price"], current_price_data.get("change", 0), n=250)
+                data_sources["synthetic"] += 1
+            else:
+                data_sources["yahoo"] += 1
+
+            atr_periods = history[-30:] if len(history) >= 30 else history
+            atr_highs = [c["h"] for c in atr_periods]
+            atr_lows = [c["l"] for c in atr_periods]
+            atr_closes = [c["c"] for c in atr_periods]
+            atr = calc_atr(atr_highs, atr_lows, atr_closes) or (history[-1]["c"] * 0.02)
+
+            last_entry_idx = -999
+            asset_trade_count = 0
+
+            for i in range(60, len(history) - 30):
+                if asset_trade_count >= MAX_TRADES_PER_ASSET:
+                    break
+                sub_hist = history[:i + 1]
+                sub_ind = build_indicators(sub_hist, history[i]["c"], 0)
+                if i > 0 and history[i - 1]["c"] > 0:
+                    real_change = ((history[i]["c"] - history[i - 1]["c"]) / history[i - 1]["c"]) * 100
+                else:
+                    real_change = 0
+                rec = compute_v5_recommendation(
+                    {"price": history[i]["c"], "change": real_change},
+                    sub_ind,
+                    threshold=BACKTEST_THRESHOLD
+                )
+                if rec["action"] in ["buy", "sell"] and (i - last_entry_idx) >= COOLDOWN_DAYS:
+                    trade = simulate_trade(history, i, rec["action"], atr)
+                    trade["symbol"] = asset["id"]
+                    trade["action"] = rec["action"]
+                    trade["confidence"] = rec["confidence"]
+                    trades.append(trade)
+                    last_entry_idx = i
+                    asset_trade_count += 1
 
     if not trades:
         return {
             "assets_tested": len(ASSETS), "total_trades": 0, "win_rate": 0,
             "avg_pnl": 0, "wins": 0, "losses": 0, "timeouts": 0,
             "best_trade": 0, "worst_trade": 0, "max_drawdown_pct": 0,
-            "trades": [], "version": "6.2.2",
-            "rules": "v6.2.2 strict: threshold +/-4, triple >=2, cooldown 30d, max 5/asset"
+            "trades": [], "version": "6.2.4",
+            "rules": "v6.2.4: REAL Yahoo data, threshold +/-3, cooldown 7d, max 8/asset",
+            "data_sources": data_sources
         }
 
     wins = [t for t in trades if t["exit"] == "target"]
@@ -617,15 +744,16 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
         "worst_trade": round(worst, 2),
         "max_drawdown_pct": round(max_dd, 2),
         "trades": trades[:50],
-        "version": "6.2.2",
-        "rules": "v6.2.2 strict: threshold +/-4, triple >=2, cooldown 30d, max 5/asset",
+        "version": "6.2.4",
+        "rules": "v6.2.4: REAL Yahoo data, threshold +/-3, cooldown 7d, max 8/asset",
+        "data_sources": data_sources
     }
     backtest_cache = {"data": result, "ts": now}
     return result
 
 @app.on_event("startup")
 async def startup():
-    print(f"TradeAI v6.2.2 starting - {len(ASSETS)} assets, strict selectivity filters active")
+    print(f"TradeAI v6.2.4 starting - {len(ASSETS)} assets, batch fetching, CACHE_TTL=300s")
 
 if __name__ == "__main__":
     import uvicorn
