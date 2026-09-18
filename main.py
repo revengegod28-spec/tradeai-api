@@ -1,14 +1,19 @@
 """
-TradeAI Backend API - v6.2.5 (Resilient + Fast)
-=================================================
-Major resilience fixes:
-  - ALWAYS returns price data (uses baseline fallback if Yahoo/CoinGecko fail)
-  - Yahoo batch endpoint (1 request for stocks instead of 8)
-  - CoinGecko batch (already in v6.2.4)
-  - CACHE_TTL extended to 5 minutes
-  - Indicator cache 15 minutes
+TradeAI Backend API - v6.2.6 (Honest Failures)
+===============================================
+Critical fix:
+  - NEVER returns fake baseline prices as if they were real
+  - When Yahoo/CoinGecko fail AND no cache exists, returns price: null
+  - Adds is_stale flag so frontend can show "unavailable" instead of fake data
 
-Stage 1+ filters (live signals) - same as v6.2.4
+Features preserved from v6.2.5:
+  - Yahoo batch endpoint
+  - CoinGecko batch
+  - CACHE_TTL 300s (5 min)
+  - Indicator cache 15 min
+  - Baseline fallback only for internal calculations, not display
+
+Stage 1+ filters (live signals) - same
 """
 import os
 import time
@@ -18,7 +23,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import aiohttp
 
-app = FastAPI(title="TradeAI API", version="6.2.5")
+app = FastAPI(title="TradeAI API", version="6.2.6")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,15 +55,6 @@ ASSETS = [
     {"id": "SP500",  "symbol": "SP500",  "name_ar": "\u0633\u062a\u0627\u0646\u062f\u0631\u062f \u0622\u0646\u062f \u0628\u0648\u0631\u0632",   "name_en": "S&P 500",           "type": "indices",    "yahoo": "^GSPC",         "coingecko": None, "batch": False},
     {"id": "NASDAQ", "symbol": "NASDAQ", "name_ar": "\u0646\u0627\u0633\u062f\u0627\u0643",             "name_en": "NASDAQ Composite",  "type": "indices",    "yahoo": "^IXIC",         "coingecko": None, "batch": False},
 ]
-
-# v6.2.5: Baseline fallback prices (used when all APIs fail)
-BASELINE_PRICES = {
-    "AAPL": 195.0, "TSLA": 250.0, "MSFT": 410.0, "GOOGL": 175.0, "AMZN": 185.0,
-    "NVDA": 130.0, "META": 510.0, "NFLX": 660.0,
-    "BTC": 65000.0, "ETH": 3500.0, "BNB": 600.0, "SOL": 150.0, "XRP": 0.55,
-    "EURUSD": 1.08, "GBPUSD": 1.27, "USDJPY": 152.0,
-    "XAUUSD": 2650.0, "WTI": 70.0, "BRENT": 74.0, "SP500": 5700.0, "NASDAQ": 18500.0,
-}
 
 price_cache: Dict[str, dict] = {}
 indicator_cache: Dict[str, dict] = {}
@@ -156,26 +152,15 @@ def synth_history(current_price, change_pct, n=250):
         out.append({"c": round(c, 6), "h": round(h, 6), "l": round(l, 6)})
     return out
 
-def get_baseline_price(asset_id):
-    """v6.2.5: Return baseline price data when all APIs fail."""
-    base = BASELINE_PRICES.get(asset_id, 100.0)
-    return {
-        "price": base,
-        "change": 0.0,
-        "high24": base * 1.01,
-        "low24": base * 0.99,
-        "volume": 0,
-        "_source": "baseline-fallback"
-    }
-
 async def fetch_yahoo_batch_quote(session, symbols):
     if not symbols:
         return {}
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
     params = {"symbols": ",".join(symbols)}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     result = {}
     try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
                 return result
             data = await r.json()
@@ -191,6 +176,7 @@ async def fetch_yahoo_batch_quote(session, symbols):
                         "high24": float(q.get("regularMarketDayHigh") or price),
                         "low24": float(q.get("regularMarketDayLow") or price),
                         "volume": float(q.get("regularMarketVolume") or 0),
+                        "_source": "yahoo-batch"
                     }
     except Exception:
         pass
@@ -199,8 +185,9 @@ async def fetch_yahoo_batch_quote(session, symbols):
 async def fetch_yahoo_single(session, symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": "1d", "range": "1d"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
                 return None
             data = await r.json()
@@ -217,6 +204,7 @@ async def fetch_yahoo_single(session, symbol):
                 "high24": float(meta.get("regularMarketDayHigh") or price),
                 "low24": float(meta.get("regularMarketDayLow") or price),
                 "volume": float(meta.get("regularMarketVolume") or 0),
+                "_source": "yahoo-single"
             }
     except Exception:
         return None
@@ -251,6 +239,7 @@ async def fetch_coingecko_batch(session, cg_ids):
                     "high24": float(d.get("usd_24h_high", price * 1.02)),
                     "low24": float(d.get("usd_24h_low", price * 0.98)),
                     "volume": float(d.get("usd_24h_vol", 0)),
+                    "_source": "coingecko-batch"
                 }
     except Exception:
         pass
@@ -301,8 +290,10 @@ def triple_confirmation(rsi, macd_signal, price, ma50, ma200, bb, action):
     return confirms
 
 def compute_v5_recommendation(asset_data, indicators, threshold=4):
-    price = asset_data.get("price", 0)
-    change = asset_data.get("change", 0)
+    price = asset_data.get("price") or 0
+    change = asset_data.get("change") or 0
+    if not is_recent_price(asset_data):
+        return {"action": "wait", "confidence": 0, "score": 0, "reasons": ["no live price data"], "levels": None, "is_stale": True}
     rsi = indicators.get("rsi")
     macd_sig = indicators.get("macd_signal")
     ma50 = indicators.get("ma_50")
@@ -376,7 +367,6 @@ def compute_v5_recommendation(asset_data, indicators, threshold=4):
 
     action = "buy" if score >= threshold else "sell" if score <= -threshold else "wait"
     original_action = action
-
     action = trend_cross_filter(action, price, ma50, ma200)
     if action == "wait" and original_action != "wait":
         reasons.append("trend cross filter: rejected")
@@ -416,6 +406,14 @@ def compute_v5_recommendation(asset_data, indicators, threshold=4):
         "levels": levels,
     }
 
+def is_recent_price(asset_data):
+    """v6.2.6: returns False for stale/baseline prices"""
+    if asset_data.get("_source") == "baseline-fallback":
+        return False
+    if asset_data.get("price") is None:
+        return False
+    return True
+
 def build_indicators(history, current_price, change_pct):
     closes = [c["c"] for c in history]
     highs = [c["h"] for c in history]
@@ -443,10 +441,23 @@ def build_indicators(history, current_price, change_pct):
         "pivot_s1": round(pivot["s1"], 4),
     }
 
+def get_unavailable_marker():
+    """v6.2.6: Honest 'data unavailable' marker - no fake prices."""
+    return {
+        "price": None,
+        "change": None,
+        "high24": None,
+        "low24": None,
+        "volume": 0,
+        "_source": "unavailable",
+        "is_stale": True
+    }
+
 async def fetch_one_asset(asset, session, batch_stocks, batch_crypto):
-    """v6.2.5: Always returns data - uses baseline fallback if all APIs fail."""
+    """v6.2.6: Always returns data structure but with price: None when APIs fail."""
     cache_key = asset["id"]
     now = time.time()
+
     if cache_key in indicator_cache and (now - indicator_cache[cache_key]["ts"]) < INDICATOR_TTL:
         cached_ind = indicator_cache[cache_key]["data"]
         cached_price = price_cache.get(cache_key, {})
@@ -463,27 +474,36 @@ async def fetch_one_asset(asset, session, batch_stocks, batch_crypto):
         price_data = await fetch_yahoo_single(session, asset["yahoo"])
 
     if price_data is None:
-        # v6.2.5: Fallback chain - try cache first, then baseline
+        # v6.2.6: NEVER return fake baseline. Return None marker.
         if cache_key in price_cache:
-            price_data = price_cache[cache_key]
-            price_data["_source"] = "cache-fallback"
+            cached = price_cache[cache_key]
+            price_data = {
+                **cached,
+                "_source": "stale-cache",
+                "is_stale": True
+            }
         else:
-            # v6.2.5: NEVER return empty - use baseline
-            price_data = get_baseline_price(cache_key)
+            price_data = get_unavailable_marker()
 
     price_cache[cache_key] = price_data
 
-    history = synth_history(price_data["price"], price_data["change"])
-    indicators = build_indicators(history, price_data["price"], price_data["change"])
-    indicator_cache[cache_key] = {"data": indicators, "ts": now}
+    if price_data.get("price") is not None:
+        history = synth_history(price_data["price"], price_data.get("change") or 0)
+        indicators = build_indicators(history, price_data["price"], price_data.get("change") or 0)
+        indicator_cache[cache_key] = {"data": indicators, "ts": now}
+    else:
+        indicators = {}
+        indicator_cache[cache_key] = {"data": indicators, "ts": now}
+
     return {**asset, **price_data, "indicators": indicators}
 
 async def fetch_yahoo_history(session, symbol, retries=2):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": "1d", "range": "1y"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     for attempt in range(retries):
         try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status != 200:
                     if attempt < retries - 1:
                         await asyncio.sleep(1)
@@ -528,14 +548,18 @@ async def fetch_one_asset_history(asset, session):
 async def root():
     return {
         "service": "TradeAI API",
-        "version": "6.2.5",
-        "stage": "RESILIENT: always returns data (baseline fallback)",
+        "version": "6.2.6",
+        "stage": "HONEST FAILURES: returns price=null instead of fake baseline",
+        "behaviour": {
+            "all_apis_ok": "returns real prices",
+            "cache_only": "returns stale prices with is_stale=true",
+            "no_data": "returns price=null with is_stale=true"
+        },
         "improvements": [
-            "Yahoo batch (1 req vs 8)",
-            "CoinGecko batch (1 req vs 5)",
-            "CACHE_TTL 300s (5 min)",
-            "Baseline fallback when APIs fail",
-            "Never returns empty array"
+            "Yahoo batch with User-Agent header",
+            "CoinGecko batch",
+            "CACHE_TTL 300s",
+            "Honest failure handling"
         ],
         "filters": ["Anti-Chase >2%", "Trend Cross", "Triple Confirmation >=2", "Threshold +/-4"],
         "assets": len(ASSETS),
@@ -570,24 +594,21 @@ async def prices(refresh: int = Query(0, ge=0, le=1)):
 
     crypto_cg_ids = [a["coingecko"] for a in ASSETS if a.get("coingecko")]
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}) as session:
         stock_task = fetch_yahoo_batch_quote(session, stock_yahoo_symbols)
         crypto_task = fetch_coingecko_batch(session, crypto_cg_ids)
         stock_resp, crypto_resp = await asyncio.gather(stock_task, crypto_task)
         batch_stocks = stock_resp
         batch_crypto = crypto_resp
 
-        # v6.2.5: Wrap each asset fetch with a timeout protection
         async def safe_fetch(asset):
             try:
                 return await asyncio.wait_for(
                     fetch_one_asset(asset, session, batch_stocks, batch_crypto),
                     timeout=20
                 )
-            except (asyncio.TimeoutError, Exception) as e:
-                # v6.2.5: Return baseline if anything fails
-                base = get_baseline_price(asset["id"])
-                return {**asset, **base, "indicators": {}, "_error": str(e)[:100]}
+            except Exception:
+                return {**asset, **get_unavailable_marker(), "indicators": {}}
 
         tasks = [safe_fetch(a) for a in ASSETS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -595,12 +616,9 @@ async def prices(refresh: int = Query(0, ge=0, le=1)):
     out = []
     for r in results:
         if isinstance(r, Exception):
-            # v6.2.5: Even on exception, include baseline
-            continue
-        if "error" in r and "_source" not in r:
             continue
         ind = r.get("indicators", {})
-        price_data = {k: v for k, v in r.items() if k in ["price", "change", "high24", "low24", "volume", "_source"]}
+        price_data = {k: v for k, v in r.items() if k in ["price", "change", "high24", "low24", "volume", "_source", "is_stale"]}
         price_data["_ts"] = now
         price_cache[r["id"]] = price_data
         indicator_cache[r["id"]] = {"data": ind, "ts": now}
@@ -624,10 +642,7 @@ async def price(symbol: str):
                 timeout=20
             )
         except Exception:
-            base = get_baseline_price(asset["id"])
-            data = {**asset, **base, "indicators": {}}
-    if "error" in data and "_source" not in data:
-        raise HTTPException(status_code=502, detail=data["error"])
+            data = {**asset, **get_unavailable_marker(), "indicators": {}}
     ind = data.get("indicators", {})
     price_data = {k: v for k, v in data.items() if k in ["price", "change", "high24", "low24", "volume"]}
     rec = compute_v5_recommendation(price_data, ind, threshold=4)
@@ -667,6 +682,14 @@ def simulate_trade(history, entry_idx, action, atr):
     pnl = ((last - entry) / entry) * 100 * (1 if action == "buy" else -1)
     return {"exit": "timeout", "pnl_pct": round(pnl, 2), "days": MAX_HOLD}
 
+BASELINE_PRICES = {
+    "AAPL": 195.0, "TSLA": 250.0, "MSFT": 410.0, "GOOGL": 175.0, "AMZN": 185.0,
+    "NVDA": 130.0, "META": 510.0, "NFLX": 660.0,
+    "BTC": 65000.0, "ETH": 3500.0, "BNB": 600.0, "SOL": 150.0, "XRP": 0.55,
+    "EURUSD": 1.08, "GBPUSD": 1.27, "USDJPY": 152.0,
+    "XAUUSD": 2650.0, "WTI": 70.0, "BRENT": 74.0, "SP500": 5700.0, "NASDAQ": 18500.0,
+}
+
 @app.get("/backtest")
 async def backtest(refresh: int = Query(0, ge=0, le=1)):
     global backtest_cache
@@ -683,7 +706,7 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
     async with aiohttp.ClientSession() as session:
         for asset in ASSETS:
             cache_key = asset["id"]
-            if cache_key in price_cache:
+            if cache_key in price_cache and price_cache[cache_key].get("price"):
                 current_price_data = price_cache[cache_key]
             else:
                 base = BASELINE_PRICES.get(asset["id"], 100)
@@ -733,8 +756,8 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
             "assets_tested": len(ASSETS), "total_trades": 0, "win_rate": 0,
             "avg_pnl": 0, "wins": 0, "losses": 0, "timeouts": 0,
             "best_trade": 0, "worst_trade": 0, "max_drawdown_pct": 0,
-            "trades": [], "version": "6.2.5",
-            "rules": "v6.2.5: REAL Yahoo data + baseline fallback",
+            "trades": [], "version": "6.2.6",
+            "rules": "v6.2.6: REAL Yahoo + honest failures",
             "data_sources": data_sources
         }
 
@@ -767,8 +790,8 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
         "worst_trade": round(worst, 2),
         "max_drawdown_pct": round(max_dd, 2),
         "trades": trades[:50],
-        "version": "6.2.5",
-        "rules": "v6.2.5: REAL Yahoo data + baseline fallback",
+        "version": "6.2.6",
+        "rules": "v6.2.6: REAL Yahoo + honest failures",
         "data_sources": data_sources
     }
     backtest_cache = {"data": result, "ts": now}
@@ -776,7 +799,7 @@ async def backtest(refresh: int = Query(0, ge=0, le=1)):
 
 @app.on_event("startup")
 async def startup():
-    print(f"TradeAI v6.2.5 starting - {len(ASSETS)} assets, RESILIENT mode")
+    print(f"TradeAI v6.2.6 starting - {len(ASSETS)} assets, HONEST FAILURES mode")
 
 if __name__ == "__main__":
     import uvicorn
